@@ -13,7 +13,15 @@ Import this module (or run `metal/patch.py` first) before building any env.
 It is a no-op when the Metal backend is not active.
 """
 
+import os
+
+import torch
 import warp as wp
+
+# The PPO update is CPU-bound (the GPU idles during it). torch defaults to a
+# small thread count; on the M5 Max (18 cores) 18 threads shaves ~6% off the
+# update (measured 867ms -> 816ms at 2048 envs). Override with METAL_TORCH_THREADS.
+torch.set_num_threads(int(os.environ.get("METAL_TORCH_THREADS", "18")))
 
 try:
     import warp_metal
