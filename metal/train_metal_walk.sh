@@ -5,9 +5,9 @@
 #   metal/train_metal_walk.sh <run-name> [num-envs] [max-iterations] [seed]
 #   metal/train_metal_walk.sh smoke 512 150 1
 #
-# Same bridge as train_metal.sh, but trains Mjlab-Sprint2mWalk-MicroDuck (the
-# reward re-shaped to translate forward). Checkpoints land in
-# logs/rsl_rl/sprint_2m_walk/ as usual.
+# Same bridge as train_metal.sh, but trains Mjlab-Sprint2m-MicroDuck with the
+# reward re-shaped to translate forward (the walk fixes are folded into the
+# sprint_2m env). Checkpoints land in logs/rsl_rl/sprint_2m/ as usual.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -23,7 +23,7 @@ LOG="logs/${RUN_NAME}.metal.log"
 import metal.bridge
 from mjlab_microduck.train_cli import main
 import sys
-sys.argv = ['train', 'Mjlab-Sprint2mWalk-MicroDuck',
+sys.argv = ['train', 'Mjlab-Sprint2m-MicroDuck',
             '--gpu-ids', 'None',
             '--env.scene.num-envs', '$NUM_ENVS',
             '--agent.max-iterations', '$MAX_ITERS',
