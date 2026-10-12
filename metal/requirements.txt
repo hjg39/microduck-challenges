@@ -1,0 +1,37 @@
+# Metal (Apple GPU) training environment for microduck-challenges.
+#
+# The main .venv is locked to warp-lang 1.12 (CPU-only on macOS). The Apple
+# Metal backend (warp-metal) overlays warp-lang 1.17, so it needs its own env.
+#
+# Verified on the M5 Max: the full MicroDuck sprint env runs on metal:0 and is
+# ~6.4x faster than CPU at 2048 parallel envs (333 ms vs 2132 ms per step).
+#
+# Install:
+#   uv venv .venv-metal --python 3.12
+#   uv pip install --python .venv-metal/bin/python -r metal/requirements.txt
+#   uv pip install --python .venv-metal/bin/python -e .
+#   uv pip install --python .venv-metal/bin/python "warp-lang==1.17.0"
+#   .venv-metal/bin/python metal/patch.py   # applies the two site-packages patches
+#
+# Train (the bridge routes physics to metal:0, torch tensors stay on cpu):
+#   .venv-metal/bin/python -c "import metal.bridge" ... see metal/train_metal.sh
+
+# --- physics / sim (the stack's versions, warp bumped to 1.17 for Metal) ---
+warp-lang==1.17.0
+mujoco-warp==3.8.1
+mujoco==3.10.0
+mjlab==1.3.0
+# the robot model + reward functions (pins warp-lang==1.12; we override to 1.17 after)
+mjlab-microduck @ git+https://github.com/pollen-robotics/microduck_rl@challenge-recipe-publishing
+# the actuator model, pinned to the exact commit the main lock uses (has vin_drop_gain_range)
+better-actuator-models @ git+https://github.com/Rhoban/bam.git@62bd8ce12154340be97e06f7f41a0ca8f116d967
+
+# --- the Apple Metal backend for Warp (prebuilt arm64 wheel from GitHub releases) ---
+warp-metal @ https://github.com/innate-inc/warp-metal/releases/download/v1.17.0.3/warp_metal-1.17.0.3-py3-none-macosx_11_0_arm64.whl
+
+# --- RL / torch ---
+torch==2.9.1
+rsl-rl-lib==5.0.1
+tensordict==0.14.2
+scipy
+tensorboard
