@@ -1,4 +1,5 @@
 .venv/
+.venv-metal/
 logs/
 __pycache__/
 *.egg-info/
