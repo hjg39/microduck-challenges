@@ -1,0 +1,39 @@
+# The 2 m Sprint, walking variant. Same Arena event as sprint_2m, but the reward
+# is re-shaped so the policy actually TRANSLATES forward instead of marching in
+# place (the "first" run plateaued: upright + shuffling feet, ~0 m/s forward).
+#
+# Changes vs sprint_2m (see env.py for the full rationale):
+#   - forward_speed_reward (new): monotonic forward gradient, breaks the standing basin
+#   - track_linear_velocity std widened (0.316 -> 0.5, curriculum) so the Gaussian is alive
+#   - foot_swing_height flipped to a positive reward, target 0.02 -> 0.05 (lift, don't drag)
+#   - leg_symmetry_reward (new): reward the centred mirror pose
+#   - gait_symmetry_penalty (new): reward balanced L/R stride
+#   - velocity-command-range curriculum (forward-only): 0.1 -> 1.2 m/s
+#   - standing_envs capped at 0.10 (was 0.25) so standing stops reinforcing itself
+#   - entropy_coef 0.01 -> 0.03 (more early exploration; the "first" run collapsed to 0.13)
+event = "sprint-2m"
+task  = "Mjlab-Sprint2mWalk-MicroDuck"
+kind  = "perpetual"
+
+[recipe]
+num_envs       = 2048
+max_iterations = 3000
+seed           = 1
+
+[params.forward_reward]
+label = "Follow the speed order"
+value = 2.0
+min   = 0.5
+max   = 5.0
+
+[params.upright_reward]
+label = "Stay upright"
+value = 2.0
+min   = 0.5
+max   = 5.0
+
+[params.step_reward]
+label = "Lift your feet"
+value = 3.0
+min   = 0.0
+max   = 6.0
