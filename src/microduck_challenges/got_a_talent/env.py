@@ -934,7 +934,7 @@ RL_CFG = RslRlOnPolicyRunnerCfg(
     wandb_project="mjlab_microduck",
     experiment_name="got_a_talent",  # logs/rsl_rl/got_a_talent/
     run_name="got_a_talent",
-    save_interval=250,
+    save_interval=100,
     num_steps_per_env=24,
     max_iterations=15_000,
 )

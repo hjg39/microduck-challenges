@@ -667,7 +667,7 @@ RL_CFG = RslRlOnPolicyRunnerCfg(
     wandb_project="mjlab_microduck",
     experiment_name="roller_sprint_2m",  # logs/rsl_rl/roller_sprint_2m/
     run_name="roller_sprint_2m",
-    save_interval=250,
+    save_interval=100,
     num_steps_per_env=24,
     max_iterations=50_000,
 )
