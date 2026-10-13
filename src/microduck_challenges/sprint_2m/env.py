@@ -93,6 +93,7 @@ BASE_ORIENTATION_MAX_PITCH_DEG = 10.0  # ±10° forward/backward tilt at episode
 BASE_ORIENTATION_MAX_ROLL_DEG = 5.0  # ±5° side-to-side tilt at episode start
 
 import torch
+from mjlab.entity import Entity
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
@@ -138,6 +139,154 @@ def heading_error(env: ManagerBasedRlEnv) -> torch.Tensor:
     reference = torch.where(env.episode_length_buf == 0, yaw, getattr(env, "_heading_ref", yaw))
     error = yaw - reference
     return torch.atan2(torch.sin(error), torch.cos(error)).unsqueeze(-1)
+
+
+def _finish_line(env: ManagerBasedRlEnv, length_m: float = 2.0) -> torch.Tensor:
+    """Per-env finish-line position: spawn position + ``length_m`` along the
+    robot's forward direction at spawn.
+
+    The Arena's sprint-2m course is a 2 m lane: the robot spawns at one end
+    and the finish is 2 m straight ahead. The command is always straight
+    (lin_vel_y = 0, ang_vel_z = 0), so the robot's forward direction at spawn
+    IS the lane direction. We anchor the finish to the spawn pose (captured on
+    the first step after reset, like ``heading_hold_reward`` anchors the spawn
+    heading) so it tracks the per-env spawn randomisation (±2° yaw, ±15 mm CoM).
+
+    Returns a (N, 3) tensor of finish positions in world frame.
+    """
+    asset = env.scene["robot"]
+    pos = asset.data.root_link_pos_w  # (N, 3)
+    quat = asset.data.root_link_quat_w  # (N, 4) [w, x, y, z]
+    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+    # Forward direction in world frame (body +X axis).
+    fwd = torch.stack(
+        [
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * w - y * z),
+            2.0 * (x * y + w * z),
+        ],
+        dim=-1,
+    )
+    finish = pos + length_m * fwd
+    if not hasattr(env, "_finish_line") or env._finish_line.shape[0] != env.num_envs:
+        env._finish_line = finish.clone()
+    just_reset = env.episode_length_buf <= 1
+    env._finish_line = torch.where(just_reset.unsqueeze(-1), finish, env._finish_line)
+    return env._finish_line
+
+
+def straight_line_reward(env: ManagerBasedRlEnv, length_m: float = 2.0) -> torch.Tensor:
+    """Potential-based reward for closing the distance to the finish line.
+
+    The 2026-10-13 run's policy wandered off a straight line to the finish —
+    the Arena's score is a straight-line sprint, so any lateral drift or
+    backtracking costs time. This rewards the *change* in distance-to-finish
+    (potential-based, so it is bias-free and does not inflate the value
+    function): positive when the duck gets closer, negative when it moves
+    away. The finish is anchored to the spawn pose (see ``_finish_line``).
+
+    Calibrated (gain 2.0) so a 0.5 m/s forward sprint earns ~0.008/step —
+    modest but a live, direction-specific gradient that the existing
+    ``forward_speed`` term (which rewards speed regardless of direction)
+    cannot provide.
+    """
+    finish = _finish_line(env, length_m)
+    root = env.scene["robot"].data.root_link_pos_w
+    dist = torch.linalg.vector_norm(root - finish, dim=-1)
+    prev = getattr(env, "_finish_dist_prev", None)
+    if prev is None:
+        env._finish_dist_prev = dist
+        return torch.zeros(env.num_envs, device=env.device)
+    reward = (prev - dist) * 2.0  # closer -> positive, farther -> negative
+    env._finish_dist_prev = dist
+    return reward
+
+
+def lateral_drift_penalty(env: ManagerBasedRlEnv, length_m: float = 2.0) -> torch.Tensor:
+    """Penalise sideways (lateral) drift relative to the finish line.
+
+    Complements ``straight_line_reward``: that term rewards *net* progress
+    toward the finish, but a policy can earn it by oscillating. This term
+    penalises the lateral *velocity* component (perpendicular to the
+    finish-line direction), so the duck is pushed to commit to a straight
+    line rather than weaving.
+    """
+    finish = _finish_line(env, length_m)
+    root = env.scene["robot"].data.root_link_pos_w
+    vel = env.scene["robot"].data.root_link_lin_vel_w
+    to_finish = finish - root
+    dist = torch.linalg.vector_norm(to_finish, dim=-1, keepdim=True).clamp_min(1e-6)
+    # Unit vector toward finish; lateral = velocity minus its forward component.
+    fwd = to_finish / dist
+    forward_speed = (vel * fwd).sum(dim=-1, keepdim=True)
+    lateral = vel - forward_speed * fwd
+    return torch.linalg.vector_norm(lateral, dim=-1)
+
+
+def head_acceleration_penalty(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Penalise jerky head/neck motion (squared change in joint velocity).
+
+    The 2026-10-13 run's policy shook its head a lot. The existing
+    ``neck_joint_vel_l2`` term penalises head *velocity* (how fast the head
+    is moving); this adds a penalty on the *change* in head velocity per
+    control step — a discrete jerk / angular-acceleration signal — so the
+    duck is pushed to move its head smoothly rather than in sharp jerks.
+
+    We use the change in joint *velocity* (Δqvel per step) rather than the
+    raw MuJoCo ``qacc``: qacc is a noisy second derivative (L2 mean ~90
+    rad/s² under random actions) that would dominate the reward at any
+    sensible weight, whereas Δqvel is on the same scale as the existing
+    ``neck_joint_vel`` term (L2 mean ~1.5, p95 ~2.7) and calibrates cleanly.
+
+    Uses the same neck+head joint set (servo-view indices 5–8: neck_pitch,
+    head_pitch, head_yaw, head_roll) as the existing neck terms.
+    """
+    asset = env.scene["robot"]
+    # Index through the servo view (same convention as the existing neck_*
+    # terms in mdp.py): the canonical 14-servo layout puts neck+head at
+    # indices 5-8. On the walk robot (no passive joints) this is the identity,
+    # but indexing through _servo_joint_ids keeps it correct if passive joints
+    # are ever added.
+    ids = microduck_mdp._servo_joint_ids(env, asset)
+    joint_vel = asset.data.joint_vel[:, ids[5:9]]
+    prev = getattr(env, "_head_vel_prev", None)
+    if prev is None or prev.shape[0] != env.num_envs:
+        env._head_vel_prev = joint_vel.clone()
+        return torch.zeros(env.num_envs, device=env.device)
+    dvel = joint_vel - prev
+    env._head_vel_prev = joint_vel.clone()
+    return torch.sum(torch.square(dvel), dim=1)
+
+
+def head_height_below(
+    env: ManagerBasedRlEnv,
+    min_height: float = 0.10,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=("neck_pitch",)),
+) -> torch.Tensor:
+    """Terminate when the HEAD centre drops below ``min_height`` (world z).
+
+    The complement to the trunk-tilt ``fell_over`` termination. The 2026-10-13
+    run's final verification fell over by BUCKING: the duck kept its trunk
+    upright (so ``bad_orientation``'s 70° tilt gate never tripped) and its head
+    well above the ground, repeatedly flexing to stay off the floor — a fall the
+    env never saw. The head is the highest, most fall-sensitive part of the
+    robot (home z ≈ 0.20 m, vs trunk 0.12 m): when it buckles to the ground the
+    head centre is the first thing to drop. Terminating on head height catches
+    the buckling fall that the trunk-tilt gate misses.
+
+    ``min_height`` 0.10 m is well below the home head height (0.20 m) and below
+    the trunk's own fell_over gate, so a normal gait (head bobbing a few mm)
+    never trips it — only a genuine collapse does.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    # Index of the head body in the entity's full body list (body_link_pos_w is
+    # indexed by that order). find_bodies resolves the name robustly.
+    ids, _ = asset.find_bodies("neck_pitch")
+    z = torch.nan_to_num(
+        asset.data.body_link_pos_w[:, ids[0], 2] - env.scene.terrain.env_origins[:, 2],
+        nan=0.0,
+    )
+    return z < min_height
 
 
 def _make_base_env_cfg(
@@ -358,6 +507,19 @@ def _make_base_env_cfg(
         func=microduck_mdp.robot_state_is_nan,
         time_out=False,
         params={"sensor_names": (feet_ground_cfg.name,)},
+    )
+
+    # Head-height fall detection (2026-10-13). The base ``fell_over`` gate is a
+    # 70° trunk-tilt check (bad_orientation, limit_angle 1.22 rad). The run's
+    # final verification fell over by BUCKING — trunk stayed upright, head kept
+    # off the floor — so that gate never tripped and the episode ran on. The
+    # head centre (home z ≈ 0.20 m) is the first thing to drop when the duck
+    # buckles, so terminate when it falls below 0.10 m. This is the complement
+    # to the tilt gate: it catches the buckling fall the tilt gate misses.
+    cfg.terminations["head_height"] = TerminationTermCfg(
+        func=head_height_below,
+        time_out=False,
+        params={"min_height": 0.10},
     )
 
     cfg.events["reset_base"].params["pose_range"]["z"] = (0.12, 0.13)
@@ -891,6 +1053,43 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         func=microduck_mdp.forward_speed_reward,
         weight=3.0,
         params={"vel_ref": 0.5, "asset_cfg": SceneEntityCfg("robot")},
+    )
+
+    # --- Straight-line-toward-finish reward (2026-10-13) ---
+    # The 2026-10-13 run's policy wandered off a straight line to the finish.
+    # forward_speed rewards speed regardless of direction; this term rewards
+    # *progress toward the finish* (potential-based: change in distance-to-
+    # finish, anchored to the spawn pose). Positive when the duck closes the
+    # gap, negative when it drifts or backtracks. Gain 2.0 → a 0.5 m/s forward
+    # sprint earns ~0.008/step: modest, so it refines direction without
+    # outvoting the forward/standing terms.
+    cfg.rewards["straight_line"] = RewardTermCfg(
+        func=straight_line_reward,
+        weight=1.0,
+        params={"length_m": 2.0},
+    )
+
+    # --- Lateral-drift penalty (2026-10-13) ---
+    # Complements straight_line: penalises the sideways velocity component
+    # (perpendicular to the finish-line direction) so the duck commits to a
+    # straight line rather than weaving. A 0.1 m/s lateral drift costs
+    # ~0.005/step at weight -0.5.
+    cfg.rewards["lateral_drift"] = RewardTermCfg(
+        func=lateral_drift_penalty,
+        weight=-0.5,
+        params={"length_m": 2.0},
+    )
+
+    # --- Head-acceleration penalty (2026-10-13) ---
+    # The run's policy shook its head a lot. The existing neck terms penalise
+    # head *velocity* (neck_joint_vel_l2) and *action* rate; this adds a
+    # penalty on head *angular acceleration* (rad/s², L2) so the duck moves
+    # its head smoothly rather than in sharp jerks. Weight -0.1: a 1 rad/s²
+    # jerk across the 4 neck/head joints costs ~0.0004/step — a gentle nudge
+    # that won't fight the head_pose_tracking objective.
+    cfg.rewards["head_acceleration"] = RewardTermCfg(
+        func=head_acceleration_penalty,
+        weight=-0.1,
     )
 
     # --- 3. foot_swing_height: flip to a positive reward, raise the target ---
