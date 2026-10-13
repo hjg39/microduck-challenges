@@ -283,13 +283,18 @@ def _make_base_env_cfg(
     )
 
 
-    # air_time window [0.125, 0.300] s. NOTE: standing still at zero command is
-    # taught by the standing_envs curriculum (→25% standing envs by ~iter 2000),
-    # not by an explicit stillness/no-stepping term.
+    # air_time window. NOTE: standing still at zero command is taught by the
+    # standing_envs curriculum, not by an explicit stillness/no-stepping term.
+    # 2026-10-13 re-balance (Harry: "big movements with pauses should also be
+    # ok"): the old window [0.125, 0.300] s only rewarded CONSTANT small steps —
+    # a big stride (0.4 s air) + a pause scored ZERO, so the policy converged to
+    # a low hover/shuffle (air_time_mean 7 s but peak foot height ~0: feet barely
+    # left the ground, never in the window). Widen to [0.10, 0.50] s so a big
+    # step AND a pause both earn reward; the gait can be either cadence.
     cfg.rewards["air_time"].weight = knobs["step_reward"]
     cfg.rewards["air_time"].params["command_threshold"] = 0.01
-    cfg.rewards["air_time"].params["threshold_min"] = 0.125
-    cfg.rewards["air_time"].params["threshold_max"] = 0.300
+    cfg.rewards["air_time"].params["threshold_min"] = 0.10
+    cfg.rewards["air_time"].params["threshold_max"] = 0.50
 
     cfg.rewards["body_ang_vel"].weight = -0.05
     cfg.rewards["angular_momentum"].weight = -0.02
@@ -713,7 +718,11 @@ def _make_base_env_cfg(
     cfg.scene.terrain.terrain_generator = None
 
     # action_rate weight ramp: gentle smoothing while the gait bootstraps, then
-    # tighten to -1.0 by iter 1500.
+    # tighten. 2026-10-13 re-balance: the old ramp hit -1.0 by iter 1500, making
+    # the leg motion needed to WALK the single largest term in the budget
+    # (-0.003/step, ~10x the forward terms) — so the duck shuffles in place
+    # (cheap) instead of striding (expensive). Cap at -0.5 and slow the ramp:
+    # keep the anti-jerk smoothing, but stop pricing a big stride 10x a small one.
     cfg.curriculum["action_rate_weight"] = CurriculumTermCfg(
         func=microduck_mdp.reward_weight,
         params={
@@ -721,10 +730,9 @@ def _make_base_env_cfg(
             "weight_stages": [
                 {"step": 0, "weight": -0.1},
                 {"step": 500 * NUM_STEPS_PER_ENV, "weight": -0.2},
-                {"step": 750 * NUM_STEPS_PER_ENV, "weight": -0.4},
-                {"step": 1000 * NUM_STEPS_PER_ENV, "weight": -0.6},
-                {"step": 1250 * NUM_STEPS_PER_ENV, "weight": -0.8},
-                {"step": 1500 * NUM_STEPS_PER_ENV, "weight": -1.0},
+                {"step": 1000 * NUM_STEPS_PER_ENV, "weight": -0.3},
+                {"step": 1500 * NUM_STEPS_PER_ENV, "weight": -0.4},
+                {"step": 2000 * NUM_STEPS_PER_ENV, "weight": -0.5},
             ],
         },
     )
@@ -871,12 +879,18 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
     # --- 1. forward_speed_reward: monotonic forward gradient (the key new term) ---
     # tanh(clamp(vx, 0)/vel_ref): rewards ANY forward motion, never penalises
-    # standing (vx=0 -> 0), saturates at vel_ref. Command-independent, so it gives
-    # a live gradient even when the tracking Gaussian is dead.
+    # standing (vx=0 -> 0). Command-independent, so it gives a live gradient even
+    # when the tracking Gaussian is dead.
+    # 2026-10-13 re-balance (the "not moving" local minimum, again): weight 1.0
+    # was outvoted ~10:1 by the standing terms (upright+head+heading+track_ang),
+    # and vel_ref 0.3 saturated below the Arena's 0.2-1.2 m/s command range.
+    # weight 3.0 + vel_ref 0.5 gives a strong, NON-saturating forward gradient
+    # across the whole command range (tanh(1.2/0.5)=0.98) so it bootstraps the
+    # duck out of the standing basin and keeps pushing it faster.
     cfg.rewards["forward_speed"] = RewardTermCfg(
         func=microduck_mdp.forward_speed_reward,
-        weight=1.0,
-        params={"vel_ref": 0.3, "asset_cfg": SceneEntityCfg("robot")},
+        weight=3.0,
+        params={"vel_ref": 0.5, "asset_cfg": SceneEntityCfg("robot")},
     )
 
     # --- 3. foot_swing_height: flip to a positive reward, raise the target ---
@@ -909,14 +923,21 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # --- 2. track_linear_velocity std: widen (curriculum, loose -> tight) ---
     # A wider Gaussian has a live gradient at the current error, so the tracking
     # reward stops being dead. Tightens as the gait forms.
+    # 2026-10-13 re-balance: the old ramp tightened 0.5 -> 0.3 by iter 1000, but
+    # the duck was still standing (error ~1.3 m/s) — at std 0.3 the Gaussian is
+    # exp(-1.3^2/0.09) ~ 0, i.e. DEAD, so the forward tracking reward collapsed
+    # 1.26 -> 0.56 over the run and standing won. Hold std at 0.5 (a live
+    # gradient at error 1.3: exp(-1.3^2/0.25) ~ 0.27) until a gait actually
+    # exists, then tighten gently. forward_speed (above) carries the bootstrap;
+    # this term only refines once the duck is moving.
     cfg.curriculum["velocity_tracking_std"] = CurriculumTermCfg(
         func=microduck_mdp.velocity_tracking_std_curriculum,
         params={
             "reward_name": "track_linear_velocity",
             "std_stages": [
                 {"step": 0, "std": 0.5},
-                {"step": 500 * NUM_STEPS_PER_ENV, "std": 0.35},
-                {"step": 1000 * NUM_STEPS_PER_ENV, "std": 0.3},
+                {"step": 1000 * NUM_STEPS_PER_ENV, "std": 0.4},
+                {"step": 2000 * NUM_STEPS_PER_ENV, "std": 0.3},
             ],
         },
     )
