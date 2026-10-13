@@ -28,25 +28,28 @@ RESUME_RUN="${5:-}"
 mkdir -p logs
 LOG="logs/${RUN_NAME}.metal.log"
 
-# Build the resume flags only when a resume-run regex is supplied.
-# NOTE: tyro runs with FlagConversionOff, so the boolean needs an explicit
-# value (--agent.resume true), not a bare flag.
-RESUME_FLAGS=()
-if [ -n "$RESUME_RUN" ]; then
-  RESUME_FLAGS=(--agent.resume true --agent.load-run "$RESUME_RUN")
-fi
-
-.venv-metal/bin/python -c "
+# Pass the resume-run regex to the python process as an env var (NOT spliced
+# into the -c string: a bash array inside the double-quoted string would expand
+# to only its first element and break the Python syntax). The python side
+# builds the resume flags from it. tyro runs with FlagConversionOff, so the
+# boolean needs an explicit value (--agent.resume true), not a bare flag.
+MICRODUCK_RESUME_RUN="$RESUME_RUN" .venv-metal/bin/python -c "
 import metal.bridge
 from mjlab_microduck.train_cli import main
-import sys
-sys.argv = ['train', 'Mjlab-Sprint2m-MicroDuck',
-            '--gpu-ids', 'None',
-            '--env.scene.num-envs', '$NUM_ENVS',
-            '--agent.max-iterations', '$MAX_ITERS',
-            '--agent.seed', '$SEED',
-            '--agent.logger', 'tensorboard',
-            '--agent.run-name', '$RUN_NAME'] + $RESUME_FLAGS
+import os, sys
+argv = ['train', 'Mjlab-Sprint2m-MicroDuck',
+        '--gpu-ids', 'None',
+        '--env.scene.num-envs', '$NUM_ENVS',
+        '--agent.max-iterations', '$MAX_ITERS',
+        '--agent.seed', '$SEED',
+        '--agent.logger', 'tensorboard',
+        '--agent.run-name', '$RUN_NAME']
+resume_run = os.environ.get('MICRODUCK_RESUME_RUN', '')
+if resume_run:
+    # tyro renders the bool as a Literal['True','False'] (capital T) under
+    # FlagConversionOff — 'true' (lowercase) is rejected.
+    argv += ['--agent.resume', 'True', '--agent.load-run', resume_run]
+sys.argv = argv
 main()
 " > "$LOG" 2>&1 &
 
