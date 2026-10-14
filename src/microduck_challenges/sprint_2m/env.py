@@ -295,7 +295,7 @@ def head_height_below(
 def head_low_penalty(
     env: ManagerBasedRlEnv,
     length_m: float = 2.0,
-    near_height: float = 0.16,
+    near_height: float = 0.13,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=("neck_pitch",)),
 ) -> torch.Tensor:
     """Penalise the head dropping toward the ground, EXCEPT at the finish line.
@@ -307,9 +307,11 @@ def head_low_penalty(
     the end of the run) — that is what this prices.
 
     Two gates, multiplied:
-      1. height ramp: 0 at ``near_height`` (home head z ≈ 0.20 m, so normal
-         gait bobbing never enters it) rising to 1 at the ``head_height``
-         termination threshold (0.10 m);
+      1. height ramp: 0 at ``near_height`` (0.13 m — 3 cm above the 0.10 m
+         termination threshold, so the head may dip to ~3 cm before the
+         penalty starts; home head z ≈ 0.20 m, so normal gait bobbing never
+         enters it) rising to 1 at the ``head_height`` termination threshold
+         (0.10 m);
       2. position gate: 1 everywhere EXCEPT within the last 0.5 m of the
          anchored finish line, where it is 0 (the dip is free there).
 
@@ -1168,15 +1170,16 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # lane — the head_height termination fired on 50-75% of episodes by the
     # end of the run (0.0 at resume). Harry's call: the duck is ALLOWED to
     # dip over the finish line (a sprint finish), so the penalty applies
-    # everywhere EXCEPT the last 0.5 m of the lane. Height ramp: 0 at 0.16 m
-    # (home head z ≈ 0.20 m, so normal gait bobbing never enters it) to 1 at
-    # the 0.10 m termination threshold. Weight -1.0: a head at 0.13 m
-    # mid-lane costs ~0.5/step — a strong signal that keeps the head up
-    # through the sprint without fighting the finish-line dip.
+    # everywhere EXCEPT the last 0.5 m of the lane. Height ramp: 0 at 0.13 m
+    # (3 cm above the 0.10 m termination threshold — the head may dip to ~3 cm
+    # before the penalty starts; home head z ≈ 0.20 m, so normal gait bobbing
+    # never enters it) to 1 at the 0.10 m termination threshold. Weight -1.0:
+    # a head at 0.115 m mid-lane costs ~0.5/step — a strong signal that keeps
+    # the head up through the sprint without fighting the finish-line dip.
     cfg.rewards["head_low"] = RewardTermCfg(
         func=head_low_penalty,
         weight=-1.0,
-        params={"length_m": 2.0, "near_height": 0.16},
+        params={"length_m": 2.0, "near_height": 0.13},
     )
 
     # --- Neck-pitch tracking (2026-10-14, walk3) ---
