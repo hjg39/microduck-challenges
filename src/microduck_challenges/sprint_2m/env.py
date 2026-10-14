@@ -122,7 +122,10 @@ from mjlab.tasks.velocity.velocity_env_cfg import make_velocity_env_cfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
 from mjlab_microduck import challenge
-from mjlab_microduck.robot.microduck_constants import MICRODUCK_WALK_ROBOT_CFG
+from mjlab_microduck.robot.microduck_constants import (
+    HOME_FRAME,
+    MICRODUCK_WALK_ROBOT_CFG,
+)
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
 
@@ -289,6 +292,65 @@ def head_height_below(
     return z < min_height
 
 
+def head_near_ground_penalty(
+    env: ManagerBasedRlEnv,
+    length_m: float = 2.0,
+    near_height: float = 0.16,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=("neck_pitch",)),
+) -> torch.Tensor:
+    """Penalise the head dropping toward the ground near the finish line.
+
+    The 2026-10-13 walk3 run's top attempts all dipped the head to the floor
+    over the finish line (the ``head_height`` termination fired on 50-75% of
+    episodes by the end of the run). The Arena scores a straight-line sprint,
+    so a finish-line head dip costs time and looks like a fall. This prices
+    the dip *before* it becomes a fall: a smooth ramp from 0 at ``near_height``
+    (home head z ≈ 0.20 m, so normal gait bobbing never enters the ramp) to 1
+    at the ``head_height`` termination threshold (0.10 m), applied only within
+    the last 0.5 m of the lane.
+
+    Reuses the same head body (``neck_pitch`` centre) and finish-line anchor
+    as the existing terms, so it stays consistent with the termination.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    ids, _ = asset.find_bodies("neck_pitch")
+    z = torch.nan_to_num(
+        asset.data.body_link_pos_w[:, ids[0], 2] - env.scene.terrain.env_origins[:, 2],
+        nan=0.0,
+    )
+    # 0 at near_height, 1 at the termination threshold (0.10 m), clamped.
+    ramp = ((near_height - z) / (near_height - 0.10)).clamp(0.0, 1.0)
+    # Only near the finish: distance to the anchored finish line.
+    finish = _finish_line(env, length_m)
+    root = env.scene["robot"].data.root_link_pos_w
+    dist = torch.linalg.vector_norm(root - finish, dim=-1)
+    return ramp * (dist < 0.5).float()
+
+
+def neck_pitch_tracking(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalise the neck pitch deviating from its HOME angle.
+
+    The 2026-10-13 walk3 pose measurement (metal/measure_pose.py on
+    model_5998.pt, vx=0.8) showed the neck sitting 5.7° BELOW home while the
+    head sat 2.3° above — the policy extended the head to counterbalance a
+    neck that the existing terms never anchored. The base env's
+    ``head_pose_tracking`` term tracks the 4D head-pose *command* (sampled
+    ±0.05 rad around home), which lets the neck drift as long as the head
+    compensates. This term pins the neck itself to home, so the head can
+    relax back to home too.
+
+    Uses the same servo-view indexing as ``head_acceleration_penalty``.
+    """
+    asset = env.scene[asset_cfg.name]
+    ids = microduck_mdp._servo_joint_ids(env, asset)
+    q = asset.data.joint_pos[:, ids[5]]  # neck_pitch
+    home = HOME_FRAME.joint_pos[r".*neck_pitch.*"]
+    return torch.square(q - home)
+
+
 def _make_base_env_cfg(
     play: bool = False,
 ) -> ManagerBasedRlEnvCfg:
@@ -312,7 +374,12 @@ def _make_base_env_cfg(
 
     std_walking = {
         # Lower body
-        r".*hip_yaw.*": 0.3,
+        # 2026-10-14 (walk3 pose measurement): the policy cants both hips to a
+        # fixed ±25.3° (0.443 rad, near-zero std) — at std 0.3 the Gaussian is
+        # exp(-0.443²/0.09) ≈ 0.15, nearly dead, so the canted stance was never
+        # priced. Tighten to 0.15 (exp(-0.443²/0.0225) ≈ 0.013 → live gradient)
+        # so the pose reward pulls the stance back to the centred mirror pose.
+        r".*hip_yaw.*": 0.15,
         r".*hip_roll.*": 0.05,  # 0.1→0.06→0.05 — hold the 5°-inward stance, stop the leg splay to vertical
         r".*hip_pitch.*": 0.4,
         r".*knee.*": 0.4,
@@ -1090,6 +1157,35 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.rewards["head_acceleration"] = RewardTermCfg(
         func=head_acceleration_penalty,
         weight=-0.1,
+    )
+
+    # --- Head-near-ground penalty (2026-10-14, walk3) ---
+    # The walk3 run's top attempts dipped the head to the floor over the
+    # finish line — the head_height termination fired on 50-75% of episodes
+    # by the end of the run (0.0 at resume). This prices the dip BEFORE it
+    # becomes a fall: a ramp from 0 at 0.16 m (home head z ≈ 0.20 m, so
+    # normal gait bobbing never enters it) to 1 at the 0.10 m termination
+    # threshold, applied only within the last 0.5 m of the lane. Weight -1.0:
+    # a head at 0.13 m near the finish costs ~0.5/step — a strong, localised
+    # signal that won't fight the gait mid-lane.
+    cfg.rewards["head_near_ground"] = RewardTermCfg(
+        func=head_near_ground_penalty,
+        weight=-1.0,
+        params={"length_m": 2.0, "near_height": 0.16},
+    )
+
+    # --- Neck-pitch tracking (2026-10-14, walk3) ---
+    # The pose measurement (metal/measure_pose.py, model_5998.pt, vx=0.8)
+    # showed the neck 5.7° BELOW home while the head sat 2.3° above — the
+    # policy extended the head to counterbalance a neck the existing terms
+    # never anchored (head_pose_tracking tracks the 4D *command*, which lets
+    # the neck drift as long as the head compensates). Pin the neck to home:
+    # squared deviation, weight -0.5. At the measured 0.099 rad deviation
+    # that costs ~0.005/step — a steady pull back to home without fighting
+    # the head_pose_tracking objective (which still owns the head itself).
+    cfg.rewards["neck_pitch_tracking"] = RewardTermCfg(
+        func=neck_pitch_tracking,
+        weight=-0.5,
     )
 
     # --- 3. foot_swing_height: flip to a positive reward, raise the target ---
