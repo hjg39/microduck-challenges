@@ -292,22 +292,26 @@ def head_height_below(
     return z < min_height
 
 
-def head_near_ground_penalty(
+def head_low_penalty(
     env: ManagerBasedRlEnv,
     length_m: float = 2.0,
     near_height: float = 0.16,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=("neck_pitch",)),
 ) -> torch.Tensor:
-    """Penalise the head dropping toward the ground near the finish line.
+    """Penalise the head dropping toward the ground, EXCEPT at the finish line.
 
-    The 2026-10-13 walk3 run's top attempts all dipped the head to the floor
-    over the finish line (the ``head_height`` termination fired on 50-75% of
-    episodes by the end of the run). The Arena scores a straight-line sprint,
-    so a finish-line head dip costs time and looks like a fall. This prices
-    the dip *before* it becomes a fall: a smooth ramp from 0 at ``near_height``
-    (home head z ≈ 0.20 m, so normal gait bobbing never enters the ramp) to 1
-    at the ``head_height`` termination threshold (0.10 m), applied only within
-    the last 0.5 m of the lane.
+    Harry's call (2026-10-14): the duck is *allowed* to dip its head over the
+    finish line (a sprint finish), so the penalty applies everywhere else in
+    the lane. The walk3 run's policy dipped the head low through the middle of
+    the lane (the ``head_height`` termination fired on 50-75% of episodes by
+    the end of the run) — that is what this prices.
+
+    Two gates, multiplied:
+      1. height ramp: 0 at ``near_height`` (home head z ≈ 0.20 m, so normal
+         gait bobbing never enters it) rising to 1 at the ``head_height``
+         termination threshold (0.10 m);
+      2. position gate: 1 everywhere EXCEPT within the last 0.5 m of the
+         anchored finish line, where it is 0 (the dip is free there).
 
     Reuses the same head body (``neck_pitch`` centre) and finish-line anchor
     as the existing terms, so it stays consistent with the termination.
@@ -320,11 +324,11 @@ def head_near_ground_penalty(
     )
     # 0 at near_height, 1 at the termination threshold (0.10 m), clamped.
     ramp = ((near_height - z) / (near_height - 0.10)).clamp(0.0, 1.0)
-    # Only near the finish: distance to the anchored finish line.
+    # Everywhere EXCEPT the last 0.5 m of the lane (the finish-line dip is free).
     finish = _finish_line(env, length_m)
     root = env.scene["robot"].data.root_link_pos_w
     dist = torch.linalg.vector_norm(root - finish, dim=-1)
-    return ramp * (dist < 0.5).float()
+    return ramp * (dist >= 0.5).float()
 
 
 def neck_pitch_tracking(
@@ -1159,17 +1163,18 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         weight=-0.1,
     )
 
-    # --- Head-near-ground penalty (2026-10-14, walk3) ---
-    # The walk3 run's top attempts dipped the head to the floor over the
-    # finish line — the head_height termination fired on 50-75% of episodes
-    # by the end of the run (0.0 at resume). This prices the dip BEFORE it
-    # becomes a fall: a ramp from 0 at 0.16 m (home head z ≈ 0.20 m, so
-    # normal gait bobbing never enters it) to 1 at the 0.10 m termination
-    # threshold, applied only within the last 0.5 m of the lane. Weight -1.0:
-    # a head at 0.13 m near the finish costs ~0.5/step — a strong, localised
-    # signal that won't fight the gait mid-lane.
-    cfg.rewards["head_near_ground"] = RewardTermCfg(
-        func=head_near_ground_penalty,
+    # --- Head-low penalty (2026-10-14, walk3) ---
+    # The walk3 run's policy dipped the head low through the MIDDLE of the
+    # lane — the head_height termination fired on 50-75% of episodes by the
+    # end of the run (0.0 at resume). Harry's call: the duck is ALLOWED to
+    # dip over the finish line (a sprint finish), so the penalty applies
+    # everywhere EXCEPT the last 0.5 m of the lane. Height ramp: 0 at 0.16 m
+    # (home head z ≈ 0.20 m, so normal gait bobbing never enters it) to 1 at
+    # the 0.10 m termination threshold. Weight -1.0: a head at 0.13 m
+    # mid-lane costs ~0.5/step — a strong signal that keeps the head up
+    # through the sprint without fighting the finish-line dip.
+    cfg.rewards["head_low"] = RewardTermCfg(
+        func=head_low_penalty,
         weight=-1.0,
         params={"length_m": 2.0, "near_height": 0.16},
     )
