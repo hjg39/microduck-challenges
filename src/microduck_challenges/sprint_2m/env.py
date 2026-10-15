@@ -372,8 +372,8 @@ def neck_pitch_tracking(
 
 
 class StrideLength:
-    """Reward how far the foot travels FORWARD relative to where the body was
-    when the foot left the ground, evaluated at landing.
+    """Reward how far the foot reaches FORWARD in the body frame during its
+    flight, evaluated at the landing. Prices stride amplitude directly.
 
     Why: 2026-10-15 (Harry: "it looks like it just walks stably"). Measured in
     the Arena (metal/measure_arena_pose.py): our policy and the current #1
@@ -387,84 +387,127 @@ class StrideLength:
     ``forward_speed`` term (tanh(vx/0.5), weight 3.0) saturates at our
     cruising speed — above it the term is a FLAT plateau (0.99 at 1.25 ->
     0.999 at 1.85 m/s) — while every cost of striding harder keeps rising
-    (action-rate, slip, balance risk). So the rational local optimum is
-    parked on the flat top of the forward hill. This term adds the missing
-    gradient on stride LENGTH directly: it rewards the foot's peak forward
-    reach (in the root's own frame) from the liftoff point, at landing.
+    (action-rate, slip, balance risk). So the rational local optimum parks on
+    the flat top of the forward hill. This term adds the missing gradient on
+    stride LENGTH directly: it rewards each foot's peak forward reach during
+    its flight, paid at the landing, reset each cycle.
 
-    Implementation mirrors ``mjlab``'s ``feet_swing_height`` class reward
-    (track a per-flight peak, pay at first contact, reset):
+    Gated on the ``foot_height_scan`` TerrainHeightSensor, NOT the contact
+    ``found`` signal. Why the height sensor (2026-10-15 walk6 diagnosis): the
+    ``feet_ground_contact`` sensor's ``found`` field reads ~0 for the whole
+    walking gait — the feet hover ~2-3 mm above the terrain and the contact
+    probe rarely fires, so ``in_air = found == 0`` is ~always true and the
+    ``first_contact`` landing event ~never fires (a landing-paid reward is
+    therefore always 0). The height sensor is a *separate*, reliable signal:
+    it reads the foot's distance above the terrain directly, and measured the
+    real gait cleanly (each foot in flight ~52% of frames, lifting 1-1.5 cm
+    average, peaks 7-9 cm).
 
-      - at LIFTOFF (``compute_first_air``): mark the root's forward (local
-        +y) coordinate.
-      - while IN AIR (``found == 0``): track the foot site's peak forward
-        coordinate relative to that marker — how far the leg reached.
-      - at LANDING (``compute_first_contact``): pay
-        ``tanh(peak / target)`` and reset. A foot that lands immediately
-        (no flight) pays the 0-1 baseline; a long reaching stride pays up.
+    Implementation — a per-foot in-flight state machine with a single
+    threshold and a falling-edge landing detector (NOT two thresholds):
 
-    The reach is measured relative to the root at liftoff, so it is a pure
-    stride-length signal, not forward progress (``straight_line`` prices
+      - grounded = ``height <= lift_threshold`` (5 mm); in_flight = ~grounded.
+      - while IN FLIGHT: accumulate the peak FORWARD reach in the body frame
+        (root's local +x axis).
+      - LANDING = the falling edge, ``was_in_flight & ~in_flight``: the foot
+        was in flight last frame and is grounded this frame — exactly one
+        landing per stride. Pay ``tanh(peak / target)``, reset the peak.
+        (Two separate in-flight/landed thresholds fail: they overlap in the
+        5-10 mm band, so the peak is accumulated and zeroed on the same frame
+        and the reward stays ~0.)
+
+    The reach is measured in the body frame (root local +x) so it is a pure
+    stride-length signal independent of the body's heading (the duck is yawed
+    ~59 deg in the Arena), not forward progress (``straight_line`` prices
     progress) and not foot height (``foot_swing_height`` prices that).
     """
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
         self._asset: Entity = env.scene[cfg.params["asset_cfg"].name]
-        self._sensor: ContactSensor = env.scene[cfg.params["sensor_name"]]
-        # The sensor's slot count drives the [B, N] contact tensors; the slot
-        # order follows the sensor's primary pattern (left foot, right foot).
-        self._num_feet = self._sensor.cfg.num_slots
-        self._step_dt = env.step_dt
-        # Foot-site indices in the SAME left->right order as the sensor slots.
+        self._sensor: TerrainHeightSensor = env.scene[cfg.params["height_sensor_name"]]
+        # Per-foot count = the height sensor's frame count ([B, F]; F = 2:
+        # left foot, right foot, following the sensor's frame site order).
+        self._num_feet = self._sensor.num_frames
+        # Foot-site indices in the SAME left->right order as the sensor frames.
         self._foot_ids = list(self._asset.find_sites("left_foot")[0]) + list(
             self._asset.find_sites("right_foot")[0]
         )
         if len(self._foot_ids) != self._num_feet:
             self._foot_ids = list(self._asset.find_sites(".*_foot$")[0])
         self._peak_fwd = torch.zeros((env.num_envs, self._num_feet), device=env.device)
+        self._was_in_flight = torch.zeros(
+            (env.num_envs, self._num_feet), dtype=torch.bool, device=env.device
+        )
 
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
         env_ids = env_ids if env_ids is not None else slice(None)
         self._peak_fwd[env_ids] = 0.0
+        self._was_in_flight[env_ids] = False
 
     def __call__(
         self,
         env: ManagerBasedRlEnv,
         target: float = 0.25,
+        lift_threshold: float = 0.005,
         command_name: str = "twist",
         command_threshold: float = 0.01,
         asset_cfg: SceneEntityCfg | None = None,  # consumed in __init__
         **_unused: object,
     ) -> torch.Tensor:
         del asset_cfg, _unused
-        sensor: ContactSensor = self._sensor
-        in_air = sensor.data.found == 0
-        first_contact = sensor.compute_first_contact(dt=self._step_dt)
+        heights = self._sensor.data.heights          # [B, F] distance above terrain
+        grounded = heights <= lift_threshold
+        in_flight = ~grounded
 
-        # Reach = how far ahead of the BODY the foot extends in the forward
-        # (local +y) axis, in world coordinates. Measuring against the root's
-        # CURRENT position (not a frozen liftoff marker) keeps the signal
-        # rotation/translation-invariant to the body's own forward drift and
-        # is exactly "how far the leg reaches past the trunk" — the stride.
-        root_fwd = self._asset.data.root_link_pos_w[:, 1]
-        foot_fwd = self._asset.data.site_pos_w[:, self._foot_ids, 1]
-        reach = foot_fwd - root_fwd.unsqueeze(1)
+        # Body-frame forward axis (root local +x in world), from the root quat.
+        q = self._asset.data.root_link_quat_w        # [B, 4] = (w, x, y, z)
+        w, x, y, z = q.unbind(dim=-1)
+        fwd_axis = torch.stack(
+            [1.0 - 2.0 * (y * y + z * z),
+             2.0 * (x * y - w * z),
+             2.0 * (x * z + w * y)],
+            dim=-1,
+        )                                            # [B, 3]
 
-        # Track the peak forward reach while the foot is in flight.
-        self._peak_fwd = torch.where(in_air, torch.maximum(self._peak_fwd, reach), self._peak_fwd)
+        # Forward reach = foot offset from the root, projected onto the body's
+        # forward axis. Measured against the root's CURRENT position (not a
+        # frozen liftoff marker) so it is "how far the leg reaches past the
+        # trunk" — invariant to the body's own forward drift and heading.
+        offset = (
+            self._asset.data.site_pos_w[:, self._foot_ids]
+            - self._asset.data.root_link_pos_w.unsqueeze(1)
+        )                                            # [B, F, 3]
+        reach = (offset * fwd_axis.unsqueeze(1)).sum(dim=-1)  # [B, F]
 
-        # At landing: pay the normalised peak reach (only while commanded to
-        # move, so standing shuffles aren't rewarded), then reset the flight.
-        command = env.command_manager.get_command(command_name)
-        active = (torch.linalg.vector_norm(command[:, :2], dim=-1) > command_threshold).float()
-        reward = torch.tanh(self._peak_fwd / max(target, 1e-6)) * first_contact.float() * active.unsqueeze(1)
-
-        n_land = torch.clamp(torch.sum(first_contact.float()), min=1.0)
-        env.extras["log"]["Metrics/stride_fwd_reach"] = (
-            torch.sum(self._peak_fwd * first_contact.float()) / n_land
+        # Accumulate the peak forward reach while the foot is in flight.
+        self._peak_fwd = torch.where(
+            in_flight, torch.maximum(self._peak_fwd, reach), self._peak_fwd
         )
-        self._peak_fwd = torch.where(first_contact, torch.zeros_like(self._peak_fwd), self._peak_fwd)
+
+        # LANDING = falling edge: was in flight last frame, grounded this frame.
+        landing = self._was_in_flight & ~in_flight
+
+        command = env.command_manager.get_command(command_name)
+        active = (
+            torch.linalg.vector_norm(command[:, :2], dim=-1) > command_threshold
+        ).float()
+        reward = (
+            torch.tanh(self._peak_fwd / max(target, 1e-6))
+            * landing.float()
+            * active.unsqueeze(1)
+        )
+
+        n_land = torch.clamp(torch.sum(landing.float()), min=1.0)
+        env.extras["log"]["Metrics/stride_fwd_reach"] = (
+            torch.sum(self._peak_fwd * landing.float()) / n_land
+        )
+
+        # Reset the flight on landing; roll the in-flight state forward.
+        self._peak_fwd = torch.where(landing, torch.zeros_like(self._peak_fwd), self._peak_fwd)
+        self._was_in_flight = in_flight
         return torch.sum(reward, dim=-1)
+
+
 
 
 def _make_base_env_cfg(
@@ -1266,14 +1309,17 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # dead-level trunk); it is stride length — the leader swings hip/knee/ankle
     # ~1.6x further at 1.85 m/s. Nothing above prices how far the foot reaches
     # during a flight, so stride amplitude is unpriced noise. This rewards the
-    # foot's peak forward reach from the liftoff point, paid at landing.
+    # foot's peak forward reach (in the body frame) from the trunk, paid at
+    # landing. Gated on the foot_height_scan sensor (reliable), not the contact
+    # `found` signal (reads ~0 for the whole gait — see the class docstring).
     cfg.rewards["stride_length"] = RewardTermCfg(
         func=StrideLength,
         weight=1.0,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "sensor_name": "feet_ground_contact",
+            "height_sensor_name": "foot_height_scan",
             "target": 0.25,
+            "lift_threshold": 0.005,
             "command_name": "twist",
             "command_threshold": 0.01,
         },
