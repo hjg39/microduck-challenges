@@ -277,9 +277,13 @@ def head_height_below(
     head centre is the first thing to drop. Terminating on head height catches
     the buckling fall that the trunk-tilt gate misses.
 
-    ``min_height`` 0.10 m is well below the home head height (0.20 m) and below
-    the trunk's own fell_over gate, so a normal gait (head bobbing a few mm)
-    never trips it — only a genuine collapse does.
+    ``min_height`` 0.03 m (2026-10-15, walk5): the home head height is 0.20 m and
+    the trunk's own ``fell_over`` gate (70° tilt) catches any real collapse long
+    before the head reaches the floor, so a normal gait (head bobbing a few mm)
+    and even a deep forward lean never trips this — only a genuine head-on-floor
+    collapse does. Raised the floor from 0.10 -> 0.03 (Harry, 2026-10-15): the
+    duck may let its head go *all the way down* to ~3 cm (well past the 0.15 m
+    wall-top the sprint finish clears) instead of dying at 10 cm.
     """
     asset: Entity = env.scene[asset_cfg.name]
     # Index of the head body in the entity's full body list (body_link_pos_w is
@@ -296,27 +300,30 @@ def head_low_penalty(
     env: ManagerBasedRlEnv,
     length_m: float = 2.0,
     near_height: float = 0.13,
+    floor: float = 0.03,
+    exempt_start: float = 0.4,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=("neck_pitch",)),
 ) -> torch.Tensor:
-    """Penalise the head dropping toward the ground, EXCEPT at the finish line.
+    """Penalise the head dropping toward the ground, EXCEPT near the ends.
 
-    Harry's call (2026-10-14): the duck is *allowed* to dip its head over the
-    finish line (a sprint finish), so the penalty applies everywhere else in
-    the lane. The walk3 run's policy dipped the head low through the middle of
-    the lane (the ``head_height`` termination fired on 50-75% of episodes by
-    the end of the run) — that is what this prices.
+    Harry's call (2026-10-14, refined 2026-10-15 walk5): the duck is *allowed*
+    to dip its head over the finish line (a sprint finish) AND at the start of
+    the lane — so the penalty applies only in the middle, where a low head is
+    the walk3 failure mode (the ``head_height`` termination fired on 50-75% of
+    episodes).
 
     Two gates, multiplied:
-      1. height ramp: 0 at ``near_height`` (0.13 m — 3 cm above the 0.10 m
-         termination threshold, so the head may dip to ~3 cm before the
-         penalty starts; home head z ≈ 0.20 m, so normal gait bobbing never
-         enters it) rising to 1 at the ``head_height`` termination threshold
-         (0.10 m);
-      2. position gate: 1 everywhere EXCEPT within the last 0.5 m of the
-         anchored finish line, where it is 0 (the dip is free there).
+      1. height ramp: 0 at ``near_height`` (0.13 m — 3 cm above the old 0.10 m
+         termination; home head z ≈ 0.20 m, so normal gait bobbing never enters
+         it) rising to 1 at ``floor`` (0.03 m — the new ``head_height``
+         termination floor). So the head is free to dip to ~3 cm and only the
+         last 3 cm toward the floor is priced.
+      2. position gate: 1 in the middle, 0 within the last 0.5 m of the anchored
+         finish line (the finish-line dip is free) and within the first
+         ``exempt_start`` m (the start dip is free).
 
-    Reuses the same head body (``neck_pitch`` centre) and finish-line anchor
-    as the existing terms, so it stays consistent with the termination.
+    Reuses the same head body (``neck_pitch`` centre) and finish-line anchor as
+    the existing terms, so it stays consistent with the termination.
     """
     asset: Entity = env.scene[asset_cfg.name]
     ids, _ = asset.find_bodies("neck_pitch")
@@ -324,13 +331,18 @@ def head_low_penalty(
         asset.data.body_link_pos_w[:, ids[0], 2] - env.scene.terrain.env_origins[:, 2],
         nan=0.0,
     )
-    # 0 at near_height, 1 at the termination threshold (0.10 m), clamped.
-    ramp = ((near_height - z) / (near_height - 0.10)).clamp(0.0, 1.0)
-    # Everywhere EXCEPT the last 0.5 m of the lane (the finish-line dip is free).
+    # 0 at near_height, 1 at the floor (0.03 m), clamped. The denominator is the
+    # floor, not the termination, so the band reaches full weight exactly where
+    # the ``head_height`` floor begins — a head may dip to ~3 cm before any cost.
+    ramp = ((near_height - z) / (near_height - floor)).clamp(0.0, 1.0)
+    # Middle lane only: free in the last 0.5 m (finish dip) and the first
+    # ``exempt_start`` m (start dip); the walk3 failure is the middle dip.
     finish = _finish_line(env, length_m)
     root = env.scene["robot"].data.root_link_pos_w
-    dist = torch.linalg.vector_norm(root - finish, dim=-1)
-    return ramp * (dist >= 0.5).float()
+    dist_to_finish = torch.linalg.vector_norm(root - finish, dim=-1)
+    dist_from_start = length_m - dist_to_finish
+    in_middle = (dist_to_finish >= 0.5) & (dist_from_start >= exempt_start)
+    return ramp * in_middle.float()
 
 
 def neck_pitch_tracking(
@@ -587,12 +599,18 @@ def _make_base_env_cfg(
     # final verification fell over by BUCKING — trunk stayed upright, head kept
     # off the floor — so that gate never tripped and the episode ran on. The
     # head centre (home z ≈ 0.20 m) is the first thing to drop when the duck
-    # buckles, so terminate when it falls below 0.10 m. This is the complement
-    # to the tilt gate: it catches the buckling fall the tilt gate misses.
+    # buckles, so terminate when the head centre drops toward the floor. This is
+    # the complement to the tilt gate: it catches the buckling fall the tilt gate
+    # misses. Floor 0.03 m (2026-10-15, was 0.10): the trunk's own ``fell_over``
+    # gate (70° tilt) catches any real collapse long before the head reaches the
+    # floor, so the head may now dip to ~3 cm — well past the 0.15 m wall-top the
+    # sprint finish clears — without the episode dying at 10 cm (Harry: "let the
+    # head go all the way down to 3 cm, and just above the autofail line near the
+    # end").
     cfg.terminations["head_height"] = TerminationTermCfg(
         func=head_height_below,
         time_out=False,
-        params={"min_height": 0.10},
+        params={"min_height": 0.03},
     )
 
     cfg.events["reset_base"].params["pose_range"]["z"] = (0.12, 0.13)
@@ -1165,21 +1183,25 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         weight=-0.1,
     )
 
-    # --- Head-low penalty (2026-10-14, walk3) ---
-    # The walk3 run's policy dipped the head low through the MIDDLE of the
-    # lane — the head_height termination fired on 50-75% of episodes by the
-    # end of the run (0.0 at resume). Harry's call: the duck is ALLOWED to
-    # dip over the finish line (a sprint finish), so the penalty applies
-    # everywhere EXCEPT the last 0.5 m of the lane. Height ramp: 0 at 0.13 m
-    # (3 cm above the 0.10 m termination threshold — the head may dip to ~3 cm
-    # before the penalty starts; home head z ≈ 0.20 m, so normal gait bobbing
-    # never enters it) to 1 at the 0.10 m termination threshold. Weight -1.0:
-    # a head at 0.115 m mid-lane costs ~0.5/step — a strong signal that keeps
-    # the head up through the sprint without fighting the finish-line dip.
+    # --- Head-low penalty (2026-10-14 walk3; refined 2026-10-15 walk5) ---
+    # The walk3 run's policy dipped the head low through the MIDDLE of the lane
+    # (the head_height termination fired on 50-75% of episodes). The walk5
+    # update (Harry): the duck is now ALLOWED to dip at BOTH ends — at the start
+    # of the lane and over the finish line — so the penalty applies only in the
+    # middle. Height ramp: 0 at 0.13 m (home head z ≈ 0.20 m, so normal gait
+    # bobbing never enters it) rising to 1 at the new 0.03 m head_height floor —
+    # the head may dip to ~3 cm and only the last 3 cm toward the floor is
+    # priced. Weight -1.0 keeps the middle-lane dip strongly discouraged (a head
+    # at 0.08 m mid-lane costs ~0.7/step) without fighting the free end dips.
     cfg.rewards["head_low"] = RewardTermCfg(
         func=head_low_penalty,
         weight=-1.0,
-        params={"length_m": 2.0, "near_height": 0.13},
+        params={
+            "length_m": 2.0,
+            "near_height": 0.13,
+            "floor": 0.03,
+            "exempt_start": 0.4,
+        },
     )
 
     # --- Neck-pitch tracking (2026-10-14, walk3) ---
