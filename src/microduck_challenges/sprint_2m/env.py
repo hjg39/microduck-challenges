@@ -111,9 +111,11 @@ from mjlab.rl import (
 )
 from mjlab.sensor import (
     ContactMatch,
+    ContactSensor,
     ContactSensorCfg,
     ObjRef,
     RingPatternCfg,
+    TerrainHeightSensor,
     TerrainHeightSensorCfg,
 )
 from mjlab.tasks.velocity import mdp
@@ -369,6 +371,102 @@ def neck_pitch_tracking(
     return torch.square(q - home)
 
 
+class StrideLength:
+    """Reward how far the foot travels FORWARD relative to where the body was
+    when the foot left the ground, evaluated at landing.
+
+    Why: 2026-10-15 (Harry: "it looks like it just walks stably"). Measured in
+    the Arena (metal/measure_arena_pose.py): our policy and the current #1
+    policy both hold a dead-LEVEL trunk (ours -0.6 deg, leader +0.4 deg) and
+    level heads — so the trunk-lean is NOT the differentiator. The difference
+    is stride length: the leader swings hip/knee/ankle ~1.6x further (1.1-1.3
+    rad vs our 0.7-0.8 rad) at a slightly faster cadence, cruising 1.85 m/s
+    where ours is capped at 1.25 m/s — the exact 2.96 s vs 0.90 s score gap.
+
+    Mechanism: nothing rewards a longer stride above ~1.2 m/s. The
+    ``forward_speed`` term (tanh(vx/0.5), weight 3.0) saturates at our
+    cruising speed — above it the term is a FLAT plateau (0.99 at 1.25 ->
+    0.999 at 1.85 m/s) — while every cost of striding harder keeps rising
+    (action-rate, slip, balance risk). So the rational local optimum is
+    parked on the flat top of the forward hill. This term adds the missing
+    gradient on stride LENGTH directly: it rewards the foot's peak forward
+    reach (in the root's own frame) from the liftoff point, at landing.
+
+    Implementation mirrors ``mjlab``'s ``feet_swing_height`` class reward
+    (track a per-flight peak, pay at first contact, reset):
+
+      - at LIFTOFF (``compute_first_air``): mark the root's forward (local
+        +y) coordinate.
+      - while IN AIR (``found == 0``): track the foot site's peak forward
+        coordinate relative to that marker — how far the leg reached.
+      - at LANDING (``compute_first_contact``): pay
+        ``tanh(peak / target)`` and reset. A foot that lands immediately
+        (no flight) pays the 0-1 baseline; a long reaching stride pays up.
+
+    The reach is measured relative to the root at liftoff, so it is a pure
+    stride-length signal, not forward progress (``straight_line`` prices
+    progress) and not foot height (``foot_swing_height`` prices that).
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+        self._asset: Entity = env.scene[cfg.params["asset_cfg"].name]
+        self._sensor: ContactSensor = env.scene[cfg.params["sensor_name"]]
+        # The sensor's slot count drives the [B, N] contact tensors; the slot
+        # order follows the sensor's primary pattern (left foot, right foot).
+        self._num_feet = self._sensor.cfg.num_slots
+        self._step_dt = env.step_dt
+        # Foot-site indices in the SAME left->right order as the sensor slots.
+        self._foot_ids = list(self._asset.find_sites("left_foot")[0]) + list(
+            self._asset.find_sites("right_foot")[0]
+        )
+        if len(self._foot_ids) != self._num_feet:
+            self._foot_ids = list(self._asset.find_sites(".*_foot$")[0])
+        self._peak_fwd = torch.zeros((env.num_envs, self._num_feet), device=env.device)
+
+    def reset(self, env_ids: torch.Tensor | None = None) -> None:
+        env_ids = env_ids if env_ids is not None else slice(None)
+        self._peak_fwd[env_ids] = 0.0
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        target: float = 0.25,
+        command_name: str = "twist",
+        command_threshold: float = 0.01,
+        asset_cfg: SceneEntityCfg | None = None,  # consumed in __init__
+        **_unused: object,
+    ) -> torch.Tensor:
+        del asset_cfg, _unused
+        sensor: ContactSensor = self._sensor
+        in_air = sensor.data.found == 0
+        first_contact = sensor.compute_first_contact(dt=self._step_dt)
+
+        # Reach = how far ahead of the BODY the foot extends in the forward
+        # (local +y) axis, in world coordinates. Measuring against the root's
+        # CURRENT position (not a frozen liftoff marker) keeps the signal
+        # rotation/translation-invariant to the body's own forward drift and
+        # is exactly "how far the leg reaches past the trunk" — the stride.
+        root_fwd = self._asset.data.root_link_pos_w[:, 1]
+        foot_fwd = self._asset.data.site_pos_w[:, self._foot_ids, 1]
+        reach = foot_fwd - root_fwd.unsqueeze(1)
+
+        # Track the peak forward reach while the foot is in flight.
+        self._peak_fwd = torch.where(in_air, torch.maximum(self._peak_fwd, reach), self._peak_fwd)
+
+        # At landing: pay the normalised peak reach (only while commanded to
+        # move, so standing shuffles aren't rewarded), then reset the flight.
+        command = env.command_manager.get_command(command_name)
+        active = (torch.linalg.vector_norm(command[:, :2], dim=-1) > command_threshold).float()
+        reward = torch.tanh(self._peak_fwd / max(target, 1e-6)) * first_contact.float() * active.unsqueeze(1)
+
+        n_land = torch.clamp(torch.sum(first_contact.float()), min=1.0)
+        env.extras["log"]["Metrics/stride_fwd_reach"] = (
+            torch.sum(self._peak_fwd * first_contact.float()) / n_land
+        )
+        self._peak_fwd = torch.where(first_contact, torch.zeros_like(self._peak_fwd), self._peak_fwd)
+        return torch.sum(reward, dim=-1)
+
+
 def _make_base_env_cfg(
     play: bool = False,
 ) -> ManagerBasedRlEnvCfg:
@@ -488,7 +586,16 @@ def _make_base_env_cfg(
     # level in steady gait while transient lean (push recovery, accel) stays
     # affordable.
     cfg.rewards["upright"].weight = knobs["upright_reward"]
-    cfg.rewards["upright"].params["std"] = math.sqrt(0.05)
+    # std² 0.05 -> 0.08 (2026-10-15 walk6): the leader strides ~1.6x further
+    # with big transient trunk tilts, and our trunk-lean-vs-speed eval (2026-07)
+    # showed a 4° steady lean costs ~0.19/step at 0.05 — enough to keep the
+    # trunk dead-level. That levelness is fine; what we lost is stride
+    # AMPLITUDE, and a 0.05 std also taxes the transient tilt of a big stride
+    # for nothing (the 2026-07 forward-fall risk came from STEADY lean, which a
+    # wider std still prices: a 4° lean is now ~0.12/step instead of 0.19).
+    # Widen to 0.08 so reaching hard stays affordable; the forward_speed and
+    # stride_length terms carry the speed push.
+    cfg.rewards["upright"].params["std"] = math.sqrt(0.08)
 
     # Foot-specific configurations. In mjlab 1.3.0 foot_swing_height is fully
     # sensor-driven (no asset_cfg); only foot_clearance/foot_slip still carry an
@@ -1137,13 +1244,39 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # 2026-10-13 re-balance (the "not moving" local minimum, again): weight 1.0
     # was outvoted ~10:1 by the standing terms (upright+head+heading+track_ang),
     # and vel_ref 0.3 saturated below the Arena's 0.2-1.2 m/s command range.
-    # weight 3.0 + vel_ref 0.5 gives a strong, NON-saturating forward gradient
-    # across the whole command range (tanh(1.2/0.5)=0.98) so it bootstraps the
-    # duck out of the standing basin and keeps pushing it faster.
+    # weight 3.0 + vel_ref 0.5 gave a strong gradient out of the standing basin
+    # (tanh(1.2/0.5)=0.98) — but at the PRICE we needed: it SATURATES at our new
+    # cruising speed. 2026-10-15 (metal/measure_arena_pose.py): our policy caps
+    # at 1.25 m/s regardless of command; tanh(1.25/0.5)=0.99, so above ~1.2 m/s
+    # the term is a FLAT plateau (0.99 -> 0.999 at 1.85 m/s, the leader's speed)
+    # while action-rate/slip/balance costs keep rising — the rational optimum
+    # parks on the flat top. vel_ref 0.5 -> 0.9 restores the slope: at 1.25 m/s
+    # tanh(1.39)=0.88 (live gradient to push harder) and only 0.96 at the
+    # leader's 1.85 m/s, so the top of the range is where the reward peaks again.
+    # Paired with the stride_length term below (rewards reaching the foot far,
+    # the actual differentiator) and a slightly relaxed upright (see above).
     cfg.rewards["forward_speed"] = RewardTermCfg(
         func=microduck_mdp.forward_speed_reward,
         weight=3.0,
-        params={"vel_ref": 0.5, "asset_cfg": SceneEntityCfg("robot")},
+        params={"vel_ref": 0.9, "asset_cfg": SceneEntityCfg("robot")},
+    )
+
+    # --- Stride-length reward (2026-10-15 walk6): the missing gradient on
+    # stride amplitude. The measured gap is not trunk-lean (both ducks hold a
+    # dead-level trunk); it is stride length — the leader swings hip/knee/ankle
+    # ~1.6x further at 1.85 m/s. Nothing above prices how far the foot reaches
+    # during a flight, so stride amplitude is unpriced noise. This rewards the
+    # foot's peak forward reach from the liftoff point, paid at landing.
+    cfg.rewards["stride_length"] = RewardTermCfg(
+        func=StrideLength,
+        weight=1.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "sensor_name": "feet_ground_contact",
+            "target": 0.25,
+            "command_name": "twist",
+            "command_threshold": 0.01,
+        },
     )
 
     # --- Straight-line-toward-finish reward (2026-10-13) ---
