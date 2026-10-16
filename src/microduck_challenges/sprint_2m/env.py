@@ -122,6 +122,7 @@ from mjlab.tasks.velocity import mdp
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
 from mjlab.tasks.velocity.velocity_env_cfg import make_velocity_env_cfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
+from mjlab.utils.lab_api.math import matrix_from_quat
 
 from mjlab_microduck import challenge
 from mjlab_microduck.robot.microduck_constants import (
@@ -413,6 +414,114 @@ def neck_pitch_tracking(
     return torch.square(q - home)
 
 
+def _trunk_lean_rad(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Trunk forward-lean: the trunk body's FORWARD axis in world, measured
+    nose-down-positive, INDEPENDENT of the neck/head pose.
+
+    The trunk base is the robot root; its local +x axis is the beak/forward
+    direction (verified: the head sits at local +x at home). A forward lean =
+    that axis tipping below the horizon. Measuring the body axis (not the
+    head position) is essential: the neck can crank the head up to *hide* a
+    forward trunk tilt in a trunk->head vector, which is exactly the
+    compensation we want to allow.
+
+    2026-10-16 (walk10): the real top-1 arena policy sprints with this
+    ~+16-20 deg; ours walks dead-level. The mjlab `upright` term is a
+    SYMMETRIC tilt penalty (exp(-‖gravity_xy‖²/std²)) so it prices forward
+    and backward lean alike and cannot specifically reward the forward lean —
+    the setpoint-bearing `forward_lean_penalty` does.
+    """
+    asset = env.scene["robot"]
+    # body local +x in world, via the rotation matrix (world = R @ body).
+    from mjlab.utils.lab_api.math import matrix_from_quat
+    R = matrix_from_quat(asset.data.root_link_quat_w)  # [B, 3, 3]
+    fwd = R[:, 0]  # body local +x in world  [B, 3]
+    horiz = torch.linalg.vector_norm(fwd[:, 0:2], dim=-1)
+    # nose-down = forward axis pointing below the horizon
+    return torch.atan2(-fwd[:, 2], horiz + 1e-6)
+
+
+def forward_lean_penalty(
+    env: ManagerBasedRlEnv,
+    lean_threshold_rad: float = 0.33,   # ~19 deg nose-down tolerated free
+    lean_ramp_rad: float = 0.08,        # ~4.6 deg from free to full price
+) -> torch.Tensor:
+    """Price the trunk pitching FORWARD (nose down) into the over-lean tip zone.
+
+    The arena leader sprints its trunk ~+16-20 deg forward-leaned (the head
+    cranks up to keep the gaze level); forward_lean_reward's setpoint
+    (0.22 rad per m/s) lands on exactly that posture, and its gaussian ALONE
+    shapes the basin around it. This term stays free across the whole
+    setpoint region and ramps a smoothstep up to full price only where the
+    trunk would actually TIP nose-down (~24-26 deg, the static-tipping limit
+    of the stance), so it taxes the over-lean without double-pricing the
+    leader's posture. Backward lean stays free here — backward_lean_penalty
+    owns that half (together they replace the symmetric `upright`).
+    """
+    lean = _trunk_lean_rad(env)  # + = nose down
+    s = torch.clamp((lean - lean_threshold_rad) / lean_ramp_rad, min=0.0, max=1.0)
+    return s * s * (3.0 - 2.0 * s)
+
+
+def forward_lean_reward(
+    env: ManagerBasedRlEnv,
+    std: float,
+    scale: float = 0.065,  # trunk lean setpoint per (m/s) of commanded speed
+    command_name: str = "twist",
+    command_threshold: float = 0.01,   # no lean business below this (standing)
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward the trunk leaning FORWARD toward a setpoint that grows with the
+    commanded speed.
+
+    ``setpoint = scale * vx_cmd`` (scale 0.065 = ~4.3° at 1.15 m/s): the
+    live top-1 arena policy (es2, the 0.90 s one) sprints with a firm
+    forward trunk lean — steady-state +4.3° (p90 ~13°, peaks ~18°, the neck
+    cranking the head up ~+4° to keep the gaze level). Our own trunk is
+    dead-level (−1°), and the symmetric ``upright`` term prices even a 4°
+    steady lean, so a duck that never leans forward is the locally optimal
+    posture — but the leader's 2.3 m/s gait *has* the lean. (The 16° figure
+    in the skill notes is the same lean, read over a different frame window;
+    the steady-state value here is the correct setpoint.) Gated on the
+    command (below ~0.01 the reward is 0 — standing stays owned by the
+    standing terms; an ungated +2.0/step at zero command would be a free
+    standing subsidy). Together with ``backward_lean_penalty`` this REPLACES
+    the symmetric ``upright`` term (set to weight 0): the symmetric reward
+    prices forward and backward lean alike and cannot specifically reward the
+    forward lean the leader has. The bigger speed lever is still stride
+    amplitude (stride_length below), not trunk lean — this term only shapes
+    the posture to match the leader.
+    """
+    lean = _trunk_lean_rad(env)  # + = nose down
+    command = env.command_manager.get_command(command_name)
+    assert command is not None
+    total_speed = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
+    active = (total_speed > command_threshold).float()
+    setpoint = scale * torch.clamp(command[:, 0], min=0.0)
+    del asset_cfg  # lean is trunk-relative, no other body needed
+    return active * torch.exp(-torch.square(lean - setpoint) / std**2)
+
+
+def backward_lean_penalty(
+    env: ManagerBasedRlEnv,
+    std: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Price the trunk pitching BACKWARD (nose up, lean < 0).
+
+    The backward half of the old symmetric ``upright`` reward, with its
+    magnitude preserved: the old term priced tilt with exp(-sin²θ/0.08²)
+    (std 0.283 ≈ sqrt(0.08)); a 10° backward tilt still costs ~0.14/step
+    (weight 2.0) here, so the safety role is intact. The FORWARD half is
+    ``forward_lean_reward``'s setpoint business, and the over-lean tip is
+    ``forward_lean_penalty``'s (see both).
+    """
+    lean = _trunk_lean_rad(env)  # + = nose down
+    backward = -lean             # + = nose up
+    del asset_cfg
+    return torch.exp(-torch.square(backward) / std**2)
+
+
 class StrideLength:
     """Reward how far the foot reaches FORWARD in the body frame during its
     flight, evaluated at the landing. Prices stride amplitude directly.
@@ -575,16 +684,23 @@ def _make_base_env_cfg(
 
     std_walking = {
         # Lower body
-        # 2026-10-14 (walk3 pose measurement): the policy cants both hips to a
-        # fixed ±25.3° (0.443 rad, near-zero std) — at std 0.3 the Gaussian is
-        # exp(-0.443²/0.09) ≈ 0.15, nearly dead, so the canted stance was never
-        # priced. Tighten to 0.15 (exp(-0.443²/0.0225) ≈ 0.013 → live gradient)
-        # so the pose reward pulls the stance back to the centred mirror pose.
-        r".*hip_yaw.*": 0.15,
-        r".*hip_roll.*": 0.05,  # 0.1→0.06→0.05 — hold the 5°-inward stance, stop the leg splay to vertical
-        r".*hip_pitch.*": 0.4,
-        r".*knee.*": 0.4,
-        r".*ankle.*": 0.25, # was 0.15
+        # 2026-10-16 (walk10): the arena's 1.15 m/s leader gait swings the
+        # legs WIDE — measured on the live top-1 ONNX: knee p90 0.75–0.97,
+        # ankle 0.73–0.87, hip 0.47–0.58 rad from home. At the old walking
+        # stds (knee 0.4, ankle 0.25) the pose reward prices that gait at
+        # ~0.3–0.5 per step — a flat tax on exactly the amplitude we need.
+        # Widen the walk band toward the leader's measured envelope (knee
+        # 1.0, ankle 0.9, hip_pitch 0.6; hip_roll kept 0.1 to hold the 5°
+        # inward sole-flat stance (0.12 lets the leader's ~8° mean cant pass
+        # nearly free while the 25° walk3 cant still costs a live 0.55), and
+        # hip_yaw 0.3 keeps the centred-mirror pull live). At command < 1.5
+        # (the whole arena range) the walking band is the active one, so this
+        # is where the widening must land.
+        r".*hip_yaw.*": 0.3,
+        r".*hip_roll.*": 0.12,
+        r".*hip_pitch.*": 0.6,
+        r".*knee.*": 1.0,
+        r".*ankle.*": 0.9,
     }
 
     site_names = ["left_foot", "right_foot"]
@@ -661,26 +777,53 @@ def _make_base_env_cfg(
     cfg.rewards["pose"].params["walking_threshold"] = 0.01
     cfg.rewards["pose"].weight = 1.0
 
-    # Body-specific reward configurations
-    cfg.rewards["upright"].params["asset_cfg"].body_names = ("trunk_base",)
-    # upright: deliberately strong (2.0 / std²=0.05, was 1.0 / std²=0.1).
-    # 2026-07 pitch-vs-speed eval: the policy walks with a +2-4° steady forward
-    # lean (p90 ~6-8°) and ~2/3 of push-induced falls at speed are FORWARD. At
-    # weight 1.0 / std²=0.1 a 4° lean cost ~0.05/step — effectively free. At
-    # 2.0 / std²=0.05 it costs ~0.19/step: enough gradient to hold the trunk
-    # level in steady gait while transient lean (push recovery, accel) stays
-    # affordable.
-    cfg.rewards["upright"].weight = knobs["upright_reward"]
-    # std² 0.05 -> 0.08 (2026-10-15 walk6): the leader strides ~1.6x further
-    # with big transient trunk tilts, and our trunk-lean-vs-speed eval (2026-07)
-    # showed a 4° steady lean costs ~0.19/step at 0.05 — enough to keep the
-    # trunk dead-level. That levelness is fine; what we lost is stride
-    # AMPLITUDE, and a 0.05 std also taxes the transient tilt of a big stride
-    # for nothing (the 2026-07 forward-fall risk came from STEADY lean, which a
-    # wider std still prices: a 4° lean is now ~0.12/step instead of 0.19).
-    # Widen to 0.08 so reaching hard stays affordable; the forward_speed and
-    # stride_length terms carry the speed push.
+    # Body-specific reward configurations — 2026-10-16 (walk10): the trunk-lean
+    # terms. The OLD `upright` (symmetric exp(-xy²/std²) on projected gravity)
+    # is disabled: it prices forward and backward lean alike, so a duck that
+    # never leans forward is the locally optimal posture — but the measured
+    # arena leader sprints with a +3° steady forward lean (head cranked up to
+    # keep the gaze level). Its replacement is a DIRECTION-ASYMMETRIC pair on
+    # the trunk's forward axis (_trunk_lean_rad, nose-down-positive):
+    #   * forward_lean_reward: gaussian at a setpoint = 0.05 rad per (m/s) of
+    #     commanded speed (level when still, ~+3° at the leader's 1.15 m/s) —
+    #     the lean the leader HAS, as a reward, so the gradient shapes it.
+    #   * backward_lean_penalty: the exact backward half of old upright
+    #     (exp(-xy²/std²), weight 0.2 not 2.0 — the forward_lean_reward's own
+    #     gaussian already prices the transient backward tail of a big stride;
+    #     0.2 keeps a live fall-safety gradient on steady nose-up).
+    #   * forward_lean_penalty (below, weight -0.5): smoothstep tip tax on
+    #     nose-down past ~19°, where the trunk would actually flip.
+    # The pose/foot/stride/forward_speed terms below carry the speed push;
+    # this block only shapes the POSTURE to match the leader.
+    cfg.rewards["upright"].weight = 0.0
     cfg.rewards["upright"].params["std"] = math.sqrt(0.08)
+    cfg.rewards["forward_lean_reward"] = RewardTermCfg(
+        func=forward_lean_reward,
+        weight=2.0,   # same magnitude as old upright: the lean is a real part of the gait
+        params={
+            "std": math.sqrt(0.08),   # 4.6° gaussian — leader's steady ~1-3° sits near the top, 12° transients ~0.3
+            "scale": 0.065,           # ~4.3° setpoint at 1.15 m/s = the leader's gait p90 (measured)
+            "command_name": "twist",
+            "command_threshold": 0.01,
+        },
+    )
+    cfg.rewards["backward_lean_penalty"] = RewardTermCfg(
+        func=backward_lean_penalty,
+        weight=0.2,
+        params={"std": math.sqrt(0.08)},
+    )
+    # Over-lean tip tax: nose-down free up to ~19°, full price by ~24°
+    # (static tipping limit of the stance). The leader's max transient is
+    # ~12°, so it never pays this; a policy that *over*-leans to fake the
+    # forward_lean_reward does.
+    cfg.rewards["forward_lean_penalty"] = RewardTermCfg(
+        func=forward_lean_penalty,
+        weight=-0.5,
+        params={
+            "lean_threshold_rad": 0.33,   # ~19°
+            "lean_ramp_rad": 0.08,        # full price by ~24°
+        },
+    )
 
     # Foot-specific configurations. In mjlab 1.3.0 foot_swing_height is fully
     # sensor-driven (no asset_cfg); only foot_clearance/foot_slip still carry an
@@ -1340,15 +1483,21 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # at 1.25 m/s regardless of command; tanh(1.25/0.5)=0.99, so above ~1.2 m/s
     # the term is a FLAT plateau (0.99 -> 0.999 at 1.85 m/s, the leader's speed)
     # while action-rate/slip/balance costs keep rising — the rational optimum
-    # parks on the flat top. vel_ref 0.5 -> 0.9 restores the slope: at 1.25 m/s
-    # tanh(1.39)=0.88 (live gradient to push harder) and only 0.96 at the
-    # leader's 1.85 m/s, so the top of the range is where the reward peaks again.
+    # parks on the flat top. vel_ref 0.5 -> 0.9 restored the slope at 1.25 m/s
+    # (tanh(1.39)=0.88) but SATURATED again at the next speed up: the arena
+    # leader's REAL world speed is ~2.2-2.5 m/s (its gait overshoots the 1.15
+    # command ~2x — see 2026-10-16 amp_sweep), and tanh(2.2/0.9)=0.987, a
+    # flat 0.99 from ~1.8 m/s up: no gradient where the leader earns its score.
+    # vel_ref 0.9 -> 1.6 (2026-10-16 walk10): tanh(1.25/1.6)=0.67 (a live
+    # bootstrap at our current cruise), 0.86 at 1.85, only 0.97 at the
+    # leader's ~2.4 — the reward's peak now sits at the LEADER's speed, and
+    # the top of the command range is where the term is steepest again.
     # Paired with the stride_length term below (rewards reaching the foot far,
-    # the actual differentiator) and a slightly relaxed upright (see above).
+    # the actual differentiator) and the new forward-lean reward (above).
     cfg.rewards["forward_speed"] = RewardTermCfg(
         func=microduck_mdp.forward_speed_reward,
         weight=3.0,
-        params={"vel_ref": 0.9, "asset_cfg": SceneEntityCfg("robot")},
+        params={"vel_ref": 1.6, "asset_cfg": SceneEntityCfg("robot")},
     )
 
     # --- Stride-length reward (2026-10-15 walk6): the missing gradient on
