@@ -441,6 +441,61 @@ def _trunk_lean_rad(env: ManagerBasedRlEnv) -> torch.Tensor:
     return torch.atan2(-fwd[:, 2], horiz + 1e-6)
 
 
+def _forward_velocity(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """The robot's ACTUAL forward (body-local +x) linear velocity, m/s, + = forward.
+
+    Used as a velocity gate: it is the robot's real speed, INDEPENDENT of the
+    commanded speed. The lean terms were originally gated on the *command*, which
+    let a standing robot (vx≈0) under a real command collect their reward for free —
+    the walk10 standing subsidy (see forward_lean_reward). Gating on this instead
+    makes the lean rewards only fire when the robot is genuinely moving.
+    """
+    asset = env.scene[asset_cfg.name]
+    return asset.data.root_link_lin_vel_b[:, 0]
+
+
+def forward_speed_reward(
+    env: ManagerBasedRlEnv,
+    vel_ref: float = 0.4,
+    command_name: str = "twist",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Monotonic forward-speed reward, now COMMAND-RELATIVE (2026-10-16 walk11).
+
+    Returns a unit reward in [0,1]::
+
+        0.75 * tanh(deficit / vel_ref)   +   0.25 * tanh(clamp(vx,0) / (2*vel_ref))
+
+    where ``deficit = clamp(vx_cmd - vx, 0)`` and ``vx`` is the robot's ACTUAL
+    forward speed (``_forward_velocity``). The outer weight is 3.0. Two
+    components, two jobs:
+
+      * DEFICIT (0.75) — a LIVE gradient to close the gap to the commanded
+        speed. Strong when the robot stands still under a real command
+        (deficit = full command), and ZERO once it matches its command. This
+        is the term that pulls the policy OUT of the standing basin. The
+        original package form was a pure absolute ``tanh(clamp(vx)/vel_ref)``:
+        ~0 at vx=0, so it gave NO push to *start*, and the walk10 vel_ref 1.6
+        bump traded the low-speed kick for the leader peak — a standing robot
+        under a command had no forward-speed push while it collected the
+        forward-lean subsidy (patched separately, below).
+      * SPEED (0.25) — a gentler absolute forward-speed reward so a robot at
+        or above its command keeps a small "keep moving / overshoot" gradient
+        toward the leader's ~2x gait. The real amplitude lever is stride_length
+        (foot reach); this is a minor complement, not the main push.
+
+    Complements ``track_linear_velocity`` (a Gaussian, dead at large error):
+    the deficit covers the "far from command" regime the Gaussian can't.
+    """
+    vx = _forward_velocity(env, asset_cfg)
+    command = env.command_manager.get_command(command_name)
+    assert command is not None
+    vx_cmd = torch.clamp(command[:, 0], min=0.0)
+    deficit = torch.clamp(vx_cmd - vx, min=0.0)
+    speed = torch.clamp(vx, min=0.0)
+    return 0.75 * torch.tanh(deficit / vel_ref) + 0.25 * torch.tanh(speed / (2.0 * vel_ref))
+
+
 def forward_lean_penalty(
     env: ManagerBasedRlEnv,
     lean_threshold_rad: float = 0.33,   # ~19 deg nose-down tolerated free
@@ -482,29 +537,37 @@ def forward_lean_reward(
     steady lean, so a duck that never leans forward is the locally optimal
     posture — but the leader's 2.3 m/s gait *has* the lean. (The 16° figure
     in the skill notes is the same lean, read over a different frame window;
-    the steady-state value here is the correct setpoint.) Gated on the
-    command (below ~0.01 the reward is 0 — standing stays owned by the
-    standing terms; an ungated +2.0/step at zero command would be a free
-    standing subsidy). Together with ``backward_lean_penalty`` this REPLACES
-    the symmetric ``upright`` term (set to weight 0): the symmetric reward
-    prices forward and backward lean alike and cannot specifically reward the
-    forward lean the leader has. The bigger speed lever is still stride
-    amplitude (stride_length below), not trunk lean — this term only shapes
-    the posture to match the leader.
+    the steady-state value here is the correct setpoint.)
+
+    The gate is on the robot's ACTUAL forward velocity, NOT the command
+    (2026-10-16 walk11). The original command gate (``command_speed > 0.01``)
+    let a robot standing still under a 0.8 m/s command collect the full +2.0/
+    step here for free — it tilted its nose down ~1.8° and collected ~1.98/
+    step while moving 0 m. Gating on ``_forward_velocity > 0.01`` makes the
+    reward fire only once the robot is genuinely moving, so a standing duck
+    must start walking to get the lean payoff. A walking duck still earns it.
+    Together with ``backward_lean_penalty`` this REPLACES the symmetric
+    ``upright`` term (set to weight 0): the symmetric reward prices forward
+    and backward lean alike and cannot specifically reward the forward lean
+    the leader has. The bigger speed lever is still stride amplitude
+    (stride_length below), not trunk lean — this term only shapes the
+    posture to match the leader.
     """
     lean = _trunk_lean_rad(env)  # + = nose down
     command = env.command_manager.get_command(command_name)
     assert command is not None
-    total_speed = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
-    active = (total_speed > command_threshold).float()
+    # GATE ON ACTUAL VELOCITY (not the command): a standing robot under a real
+    # command must not collect the lean reward for free. See the note above.
+    active = (_forward_velocity(env, asset_cfg) > command_threshold).float()
     setpoint = scale * torch.clamp(command[:, 0], min=0.0)
-    del asset_cfg  # lean is trunk-relative, no other body needed
     return active * torch.exp(-torch.square(lean - setpoint) / std**2)
 
 
 def backward_lean_penalty(
     env: ManagerBasedRlEnv,
     std: float,
+    command_name: str = "twist",
+    command_threshold: float = 0.01,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """Price the trunk pitching BACKWARD (nose up, lean < 0).
@@ -515,11 +578,18 @@ def backward_lean_penalty(
     (weight 2.0) here, so the safety role is intact. The FORWARD half is
     ``forward_lean_reward``'s setpoint business, and the over-lean tip is
     ``forward_lean_penalty``'s (see both).
+
+    Gated on ACTUAL forward velocity (2026-10-16 walk11), mirroring
+    ``forward_lean_reward``: a standing robot (vx≈0) is paid this upright
+    bonus for free, which — together with the forward-lean subsidy — is the
+    standing attractor. Gating makes the upright bonus a part of the *gait*
+    rather than a free standing reward. Standing is still kept stable by the
+    pose / foot terms; the forward_speed deficit now carries the push to move.
     """
     lean = _trunk_lean_rad(env)  # + = nose down
     backward = -lean             # + = nose up
-    del asset_cfg
-    return torch.exp(-torch.square(backward) / std**2)
+    active = (_forward_velocity(env, asset_cfg) > command_threshold).float()
+    return active * torch.exp(-torch.square(backward) / std**2)
 
 
 class StrideLength:
@@ -804,13 +874,19 @@ def _make_base_env_cfg(
             "std": math.sqrt(0.08),   # 4.6° gaussian — leader's steady ~1-3° sits near the top, 12° transients ~0.3
             "scale": 0.065,           # ~4.3° setpoint at 1.15 m/s = the leader's gait p90 (measured)
             "command_name": "twist",
-            "command_threshold": 0.01,
+            "command_threshold": 0.01,   # velocity gate (walk11): no lean business below this ACTUAL speed
+            "asset_cfg": SceneEntityCfg("robot"),
         },
     )
     cfg.rewards["backward_lean_penalty"] = RewardTermCfg(
         func=backward_lean_penalty,
         weight=0.2,
-        params={"std": math.sqrt(0.08)},
+        params={
+            "std": math.sqrt(0.08),
+            "command_name": "twist",
+            "command_threshold": 0.01,   # velocity gate (walk11): upright bonus only while actually moving
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
     )
     # Over-lean tip tax: nose-down free up to ~19°, full price by ~24°
     # (static tipping limit of the stance). The leader's max transient is
@@ -1494,10 +1570,28 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # the top of the command range is where the term is steepest again.
     # Paired with the stride_length term below (rewards reaching the foot far,
     # the actual differentiator) and the new forward-lean reward (above).
+    #
+    # 2026-16 WALK11 (the standing attractor, resolved): the absolute form above
+    # is exactly the trap. A robot standing still (vx=0) scored tanh(0/1.6)=0,
+    # so it had NO forward-speed push to start — while the forward-lean reward
+    # (command-gated) paid it ~2.0/step for tilting. ~60:1 in favour of standing.
+    # It is now our LOCAL command-relative form (forward_speed_reward, above):
+    # a DEFICIT gradient (0.75*tanh((vx_cmd - vx)/vel_ref)) that is STRONG when
+    # the robot stands under a real command and ZERO once it matches its speed,
+    # plus a gentle 0.25*tanh(vx/(2*vel_ref)) to keep an overshoot push. vel_ref
+    # 1.6 -> 0.4 re-tunes the deficit scale so a 0.8 m/s command while standing
+    # scores a live ~0.71 (the push to start), and a robot at its command drops
+    # the deficit to 0 but keeps the speed tail. This is the term that breaks
+    # the standing basin; the lean terms (now velocity-gated, above) no longer
+    # subsidise it.
     cfg.rewards["forward_speed"] = RewardTermCfg(
-        func=microduck_mdp.forward_speed_reward,
+        func=forward_speed_reward,
         weight=3.0,
-        params={"vel_ref": 1.6, "asset_cfg": SceneEntityCfg("robot")},
+        params={
+            "vel_ref": 0.4,
+            "command_name": "twist",
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
     )
 
     # --- Stride-length reward (2026-10-15 walk6): the missing gradient on

@@ -2,9 +2,10 @@
 # Train the MicroDuck sprint WALKING variant on the Apple GPU (Metal).
 #
 # Usage:
-#   metal/train_metal_walk.sh <run-name> [num-envs] [max-iterations] [seed] [resume-run-regex]
+#   metal/train_metal_walk.sh <run-name> [num-envs] [max-iterations] [seed] [resume-run-regex] [load-checkpoint-regex]
 #   metal/train_metal_walk.sh smoke 512 150 1
 #   metal/train_metal_walk.sh walk3 2048 3000 1 '2026-10-13_08-44-51_walk2'
+#   metal/train_metal_walk.sh walk11 2048 20500 1 '2026-10-16_10-24-22_walk9' model_21400
 #
 # Same bridge as train_metal.sh, but trains Mjlab-Sprint2m-MicroDuck with the
 # reward re-shaped to translate forward (the walk fixes are folded into the
@@ -16,6 +17,12 @@
 # step-based curricula are all restored — this is a same-task continuation, so
 # the curricula stay at their final stage rather than restarting). Leave it
 # empty to train from scratch.
+#
+# The optional 6th arg is a regex matched against the checkpoint FILENAMES in
+# the resumed run directory (default ".*" = the highest-numbered). Use it to
+# pin the resume to a SPECIFIC checkpoint, e.g. model_21400 — needed when the
+# run's latest checkpoint is bad (e.g. a policy that collapsed to a standing
+# attractor, 2026-10-16: walk9's 21500+ stood still, 21400 was the last walker).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -24,6 +31,7 @@ NUM_ENVS="${2:-2048}"
 MAX_ITERS="${3:-3000}"
 SEED="${4:-1}"
 RESUME_RUN="${5:-}"
+LOAD_CHECKPOINT="${6:-}"
 
 mkdir -p logs
 LOG="logs/${RUN_NAME}.metal.log"
@@ -33,7 +41,7 @@ LOG="logs/${RUN_NAME}.metal.log"
 # to only its first element and break the Python syntax). The python side
 # builds the resume flags from it. tyro runs with FlagConversionOff, so the
 # boolean needs an explicit value (--agent.resume true), not a bare flag.
-MICRODUCK_RESUME_RUN="$RESUME_RUN" .venv-metal/bin/python -c "
+MICRODUCK_RESUME_RUN="$RESUME_RUN" MICRODUCK_LOAD_CHECKPOINT="$LOAD_CHECKPOINT" .venv-metal/bin/python -c "
 import metal.bridge
 from mjlab_microduck.train_cli import main
 import os, sys
@@ -49,12 +57,17 @@ if resume_run:
     # tyro renders the bool as a Literal['True','False'] (capital T) under
     # FlagConversionOff — 'true' (lowercase) is rejected.
     argv += ['--agent.resume', 'True', '--agent.load-run', resume_run]
+    load_ckpt = os.environ.get('MICRODUCK_LOAD_CHECKPOINT', '')
+    if load_ckpt:
+        argv += ['--agent.load-checkpoint', load_ckpt]
 sys.argv = argv
 main()
 " > "$LOG" 2>&1 &
 
 if [ -n "$RESUME_RUN" ]; then
-  echo "Metal training '$RUN_NAME' ($NUM_ENVS envs, $MAX_ITERS iters) started, RESUMING from '$RESUME_RUN'."
+  CKPT_MSG=" (latest checkpoint)"
+  if [ -n "$LOAD_CHECKPOINT" ]; then CKPT_MSG=" (checkpoint '$LOAD_CHECKPOINT')"; fi
+  echo "Metal training '$RUN_NAME' ($NUM_ENVS envs, $MAX_ITERS iters) started, RESUMING from '$RESUME_RUN'$CKPT_MSG."
 else
   echo "Metal training '$RUN_NAME' ($NUM_ENVS envs, $MAX_ITERS iters) started (from scratch)."
 fi
