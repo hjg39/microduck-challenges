@@ -177,6 +177,17 @@ def _finish_line(env: ManagerBasedRlEnv, length_m: float = 2.0) -> torch.Tensor:
         env._finish_line = finish.clone()
     just_reset = env.episode_length_buf <= 1
     env._finish_line = torch.where(just_reset.unsqueeze(-1), finish, env._finish_line)
+    # Store the fixed LANE AXIS (unit spawn->finish) and spawn position at
+    # reset. The lateral_drift strip needs a STABLE reference axis; deriving it
+    # from the instantaneous to_finish vector fails (that vector is colinear
+    # with its own unit direction, so the cross product is always ~0). Only the
+    # reset envs re-anchor; the rest keep their episode-start axis.
+    if hasattr(env, "_lane_axis"):
+        env._lane_axis[just_reset] = fwd[just_reset]
+        env._lane_spawn[just_reset] = pos[just_reset]
+    else:
+        env._lane_axis = fwd.clone()
+        env._lane_spawn = pos.clone()
     return env._finish_line
 
 
@@ -207,25 +218,48 @@ def straight_line_reward(env: ManagerBasedRlEnv, length_m: float = 2.0) -> torch
     return reward
 
 
-def lateral_drift_penalty(env: ManagerBasedRlEnv, length_m: float = 2.0) -> torch.Tensor:
-    """Penalise sideways (lateral) drift relative to the finish line.
+def lateral_drift_penalty(env: ManagerBasedRlEnv, length_m: float = 2.0,
+                          strip_width: float = 0.155) -> torch.Tensor:
+    """Penalise sideways drift beyond a *wide* strip centred on the lane.
 
     Complements ``straight_line_reward``: that term rewards *net* progress
-    toward the finish, but a policy can earn it by oscillating. This term
-    penalises the lateral *velocity* component (perpendicular to the
-    finish-line direction), so the duck is pushed to commit to a straight
-    line rather than weaving.
+    toward the finish, but a policy can earn it by oscillating. This prices
+    the lateral *offset* from the lane centreline (perpendicular to the
+    finish direction) so the duck is steered back only when it wanders well
+    off the line.
+
+    2026-10-16 (Harry: "reward for moving in a perfect straight line should be
+    much more lenient — stay within a wide strip of about 2.5x the duck's
+    width"): the earlier version priced lateral *velocity* (how fast the duck
+    weaved), so any weaving cost reward and fought the free gait. Now the duck
+    moves at zero cost while its lateral offset stays within ``strip_width``
+    (0.155 m half-width = 1.25x the 0.124 m trunk width, i.e. a 0.31 m strip,
+    ~2.5x the body width), and the penalty ramps linearly from 0 at the strip
+    edge to a full unit penalty at 2x the edge (0.31 m off the centreline —
+    the arena lane is far wider than that, so a full sprint can happen almost
+    entirely inside the free strip). Inside the strip the duck can weave,
+    self-correct and stride freely with no straight-line cost.
     """
-    finish = _finish_line(env, length_m)
     root = env.scene["robot"].data.root_link_pos_w
-    vel = env.scene["robot"].data.root_link_lin_vel_w
-    to_finish = finish - root
-    dist = torch.linalg.vector_norm(to_finish, dim=-1, keepdim=True).clamp_min(1e-6)
-    # Unit vector toward finish; lateral = velocity minus its forward component.
-    fwd = to_finish / dist
-    forward_speed = (vel * fwd).sum(dim=-1, keepdim=True)
-    lateral = vel - forward_speed * fwd
-    return torch.linalg.vector_norm(lateral, dim=-1)
+    # Reference lane axis: the unit spawn->finish direction captured at reset
+    # (a STABLE axis for the whole episode). Deriving it from the instantaneous
+    # root->finish vector fails — that vector is colinear with its own unit
+    # direction, so a cross-product offset would be identically zero. (The
+    # _finish_line helper populates these on each call; only just-reset envs
+    # re-anchor, so a running episode keeps its start-of-episode axis.)
+    _finish_line(env, length_m)
+    axis = env._lane_axis
+    spawn = env._lane_spawn
+    vec = root - spawn                          # position relative to spawn
+    along = (vec * axis).sum(dim=-1, keepdim=True)
+    lateral = vec - along * axis                # perpendicular part = the offset
+    lat_offset = torch.linalg.vector_norm(lateral, dim=-1)
+    # free inside the strip; linear ramp to a full unit penalty at 2x the edge,
+    # clamped at 1.0 so a fully off-lane duck costs a BOUNDED -0.5/step (the
+    # weight) rather than an unbounded penalty that would out-vote the stride
+    # reward and re-impose a tight-centre bias.
+    beyond = (lat_offset - strip_width) / strip_width
+    return torch.clamp(beyond, min=0.0, max=1.0)
 
 
 def head_acceleration_penalty(env: ManagerBasedRlEnv) -> torch.Tensor:
@@ -1261,10 +1295,15 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                                        Gaussian has a live gradient at the current error.
       3. foot_swing_height           : flipped -0.25 -> +0.5, target 0.02 -> 0.05 m.
                                        Reward feet that LIFT, not feet that drag.
-      4. leg_symmetry_reward (NEW)   : -mean|q_left + q_right| over the leg joints —
-                                       reward the centred mirror pose (Harry's idea).
-      5. gait_symmetry_penalty (NEW) : penalise cumulative L/R swing imbalance —
-                                       reward a balanced stride (complements #4).
+      4. leg/gait symmetry terms     : REMOVED (2026-10-16, Harry: "our rewards
+                                       for symmetry should get removed") — they
+                                       taxed the natural L/R asymmetry of a stride.
+      5. lateral_drift (REWORKED)    : 2026-10-16 (Harry: "moving in a perfect
+                                       straight line should be much more lenient —
+                                       stay within a wide strip of about 2.5x the
+                                       duck's width"). Now a *position* penalty with
+                                       a wide free strip (0.31 m = 2.5x the 0.124 m
+                                       body): zero cost inside, ramp beyond.
       6. velocity-command-range      : forward-only curriculum 0.1 -> 1.2 m/s, so the
                                        early target is easy and the gait bootstraps.
       7. standing_envs               : capped at 0.10 (was 0.25) and delayed, so the
@@ -1339,15 +1378,19 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         params={"length_m": 2.0},
     )
 
-    # --- Lateral-drift penalty (2026-10-13) ---
-    # Complements straight_line: penalises the sideways velocity component
-    # (perpendicular to the finish-line direction) so the duck commits to a
-    # straight line rather than weaving. A 0.1 m/s lateral drift costs
-    # ~0.005/step at weight -0.5.
+    # --- Lateral-drift / lane-strip penalty (2026-10-13, reworked 2026-10-16) ---
+    # 2026-10-16 (Harry: "moving in a perfect straight line should be much more
+    # lenient — stay within a wide strip of about 2.5x the duck's width"): this
+    # is now a *position* penalty with a wide free strip, not a velocity cost.
+    # Zero cost while the duck's lateral offset from the lane centreline is
+    # within strip_width (0.155 m = 1.25x the 0.124 m trunk width -> 0.31 m
+    # strip, ~2.5x the body); a linear ramp to a unit penalty at 2x the edge.
+    # Inside the strip the duck can weave and self-correct for free.
+    # Weight -0.5: a full strip-edge breach (0.31 m off-centre) costs ~0.005.
     cfg.rewards["lateral_drift"] = RewardTermCfg(
         func=lateral_drift_penalty,
         weight=-0.5,
-        params={"length_m": 2.0},
+        params={"length_m": 2.0, "strip_width": 0.155},
     )
 
     # --- Head-acceleration penalty (2026-10-13) ---
@@ -1405,24 +1448,14 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.rewards["foot_swing_height"].params["target_height"] = 0.05
     cfg.rewards["foot_swing_height"].params["command_threshold"] = 0.01
 
-    # --- 4. leg_symmetry_reward: reward the centred mirror pose ---
-    # -mean|q_left + q_right| over the leg joints; positive weight penalises
-    # asymmetry. Joint-position based, so the actor (which sees joint_pos) can
-    # act on it directly.
-    cfg.rewards["leg_symmetry"] = RewardTermCfg(
-        func=microduck_mdp.leg_symmetry_reward,
-        weight=0.5,
-        params={"asset_cfg": SceneEntityCfg("robot")},
-    )
-
-    # --- 5. gait_symmetry_penalty: reward a balanced L/R stride ---
-    # Penalises cumulative swing imbalance |L-R|/(L+R) over the episode. Complements
-    # leg_symmetry (pose-level) with gait-level balance.
-    cfg.rewards["gait_symmetry"] = RewardTermCfg(
-        func=microduck_mdp.gait_symmetry_penalty,
-        weight=-0.2,
-        params={"sensor_name": "feet_ground_contact"},
-    )
+    # --- 4. Symmetry terms: REMOVED (2026-10-16, Harry: "our rewards for
+    # symmetry should get removed"). leg_symmetry (was +0.5: -mean|q_left+
+    # q_right|, pushing a centred mirror pose) and gait_symmetry (was -0.2:
+    # L/R swing imbalance) together taxed the natural left-right asymmetry of
+    # a stride, so they fought the free gait. Deleting the cfg entries drops
+    # them from the reward manager (26 -> 24 active terms); the functions
+    # themselves stay in microduck_mdp (unused here but kept for the base
+    # recipe / future use).
 
     # --- 2. track_linear_velocity std: widen (curriculum, loose -> tight) ---
     # A wider Gaussian has a live gradient at the current error, so the tracking
