@@ -1591,7 +1591,7 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # subsidise it.
     cfg.rewards["forward_speed"] = RewardTermCfg(
         func=forward_speed_reward,
-        weight=3.0,
+        weight=4.0,
         params={
             "kick_ref": 0.25,
             "tail_ref": 1.6,
