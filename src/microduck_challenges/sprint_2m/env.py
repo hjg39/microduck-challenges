@@ -456,44 +456,49 @@ def _forward_velocity(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torc
 
 def forward_speed_reward(
     env: ManagerBasedRlEnv,
-    vel_ref: float = 0.4,
+    kick_ref: float = 0.25,
+    tail_ref: float = 1.6,
     command_name: str = "twist",
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Monotonic forward-speed reward, now COMMAND-RELATIVE (2026-10-16 walk11).
+    """Monotonic forward-speed reward, ACTUAL-velocity based (2026-10-16 walk12).
 
     Returns a unit reward in [0,1]::
 
-        0.75 * tanh(deficit / vel_ref)   +   0.25 * tanh(clamp(vx,0) / (2*vel_ref))
+        0.5 * tanh(clamp(vx, 0) / kick_ref)  +  0.5 * tanh(clamp(vx, 0) / tail_ref)
 
-    where ``deficit = clamp(vx_cmd - vx, 0)`` and ``vx`` is the robot's ACTUAL
-    forward speed (``_forward_velocity``). The outer weight is 3.0. Two
-    components, two jobs:
+    where ``vx`` is the robot's ACTUAL forward speed (``_forward_velocity``).
+    The outer weight is 3.0. Two components, one direction — a reward that
+    INCREASES monotonically with real forward speed:
 
-      * DEFICIT (0.75) — a LIVE gradient to close the gap to the commanded
-        speed. Strong when the robot stands still under a real command
-        (deficit = full command), and ZERO once it matches its command. This
-        is the term that pulls the policy OUT of the standing basin. The
-        original package form was a pure absolute ``tanh(clamp(vx)/vel_ref)``:
-        ~0 at vx=0, so it gave NO push to *start*, and the walk10 vel_ref 1.6
-        bump traded the low-speed kick for the leader peak — a standing robot
-        under a command had no forward-speed push while it collected the
-        forward-lean subsidy (patched separately, below).
-      * SPEED (0.25) — a gentler absolute forward-speed reward so a robot at
-        or above its command keeps a small "keep moving / overshoot" gradient
-        toward the leader's ~2x gait. The real amplitude lever is stride_length
-        (foot reach); this is a minor complement, not the main push.
+      * KICK (0.5, ref 0.25) — a steep gradient for the first 0.25 m/s of
+        motion. This is the term that pulls the policy OFF the standing basin:
+        a robot at vx≈0.03 earns ~0.06/step, one moving at 0.3 earns ~0.6.
+      * TAIL (0.5, ref 1.6) — a long gradient that keeps rising toward the
+        leader's ~2 m/s sprint and saturates just past it. The arena leader
+        finishes 2 m in 0.9 s (avg ~2.2 m/s); the reference walker peaked at
+        0.4. This tail is the only term with a live gradient all the way to
+        the leader gait.
 
-    Complements ``track_linear_velocity`` (a Gaussian, dead at large error):
-    the deficit covers the "far from command" regime the Gaussian can't.
+    WALK11 BUG (measured 2026-10-16): the walk11 form was
+    ``0.75*tanh(deficit/0.4) + 0.25*tanh(vx/0.8)`` with
+    ``deficit = clamp(vx_cmd - vx, 0)``. The deficit SATURATES at a 0.4 m/s
+    gap, so a robot STANDING under a 1.2 m/s command (deficit 1.2) earned
+    0.75*0.995+0.25*0 ≈ 0.75 unit → 2.25/step, while a robot WALKING AT the
+    command (deficit 0) earned only 0.25*0.87 ≈ 0.22 unit → 0.66/step.
+    Standing was rewarded 3.3× more than walking — the "push out of
+    standing" became the standing subsidy, and 100 PPO iters of it dragged a
+    healthy walker (re-seeded model_21400) into the standing basin. The fix
+    is to reward actual speed monotonically: standing pays ~0.06 (weight 3.0:
+    ~0.19/step), walking at 1.2 pays ~2.4/step, and the gradient is live up
+    to the leader gait. Command-relative terms are kept for the lean pair
+    only (where the gate is on ACTUAL velocity, so standing collects nothing).
     """
     vx = _forward_velocity(env, asset_cfg)
     command = env.command_manager.get_command(command_name)
     assert command is not None
-    vx_cmd = torch.clamp(command[:, 0], min=0.0)
-    deficit = torch.clamp(vx_cmd - vx, min=0.0)
     speed = torch.clamp(vx, min=0.0)
-    return 0.75 * torch.tanh(deficit / vel_ref) + 0.25 * torch.tanh(speed / (2.0 * vel_ref))
+    return 0.5 * torch.tanh(speed / kick_ref) + 0.5 * torch.tanh(speed / tail_ref)
 
 
 def forward_lean_penalty(
@@ -1588,7 +1593,8 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         func=forward_speed_reward,
         weight=3.0,
         params={
-            "vel_ref": 0.4,
+            "kick_ref": 0.25,
+            "tail_ref": 1.6,
             "command_name": "twist",
             "asset_cfg": SceneEntityCfg("robot"),
         },
