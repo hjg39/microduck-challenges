@@ -16,7 +16,7 @@ def sweep(onnx, label):
     print(f"\n=== {label}  ({os.path.basename(onnx)}) ===")
     print(f"  cmd_vx  status   real_fwd_speed  amp_ratio  (mid-run m/s from trace)")
     rows=[]
-    for vx in [0.25, 0.5, 0.8, 1.0, 1.15, 1.2]:
+    for vx in [0.25, 0.5, 0.8, 1.0, 1.15, 1.2, 1.6, 2.0, 2.5]:
         out = arena.runner.run_once(m, pol, 1, None, np.array(m.command_at(vx)))
         t = np.asarray(out.trace, np.float32)
         pos = t[:, 0:3]           # root xyz (world)

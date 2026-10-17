@@ -1622,11 +1622,24 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # `found` signal (reads ~0 for the whole gait — see the class docstring).
     cfg.rewards["stride_length"] = RewardTermCfg(
         func=StrideLength,
-        weight=1.0,
+        # walk15: 1.0 -> 5.0, target 0.35 -> 0.15. The stride probe measured the
+        # TRUE gap: leader foot forward-reach 0.151 m vs our 0.081 m (1.9x) and,
+        # from the training metric, peak-reach-at-landing 0.151 vs 0.027 (5.6x).
+        # The amp sweep (metal/amp_sweep.py) proved the duck is locked to a single
+        # 0.55 m/s gait at EVERY command (no fast-mode attractor) while the leader
+        # is bistable: shuffles <1.0, flips to a 2.28 m/s sprint at 1.15-1.20.
+        # Nothing above prices how FAR the foot reaches, so the amplitude is
+        # unpriced noise and the policy parks on the flat top of forward_speed.
+        # Re-target the hill to the leader's measured reach (0.15 m) and make it a
+        # dominant term so PPO climbs the amplitude gradient into the leader's
+        # gait basin. Gated on command (active>0.01) so it does NOT re-subsidise
+        # the standing basin (walk11/14 fix stays intact); it double-rewards the
+        # air_time 3.0 bounding gait, so stride and clearance push together.
+        weight=5.0,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
             "height_sensor_name": "foot_height_scan",
-            "target": 0.35,
+            "target": 0.15,
             "lift_threshold": 0.005,
             "command_name": "twist",
             "command_threshold": 0.01,
