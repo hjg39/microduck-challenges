@@ -712,24 +712,37 @@ class StrideLength:
         active = (
             torch.linalg.vector_norm(command[:, :2], dim=-1) > command_threshold
         ).float()
-        # walk15b motion gate: big reach only pays if it PRODUCES motion.
-        # walk15 (5x ungated) was beaten by an amplitude-hack attractor within
-        # 100 iters: the 5-seed arena probe on 23700 showed the policy flapping
-        # its feet in place (trunk +/-160 deg, v_steady ~0.00-0.02 m/s, 0/5
-        # finishes at 0.8/1.15; the 22900 baseline was 9/10 at 0.8) - it pays
-        # the stride reward for a large peak_fwd reach WITHOUT net displacement.
-        # Gate the payoff on the body-frame forward velocity at the landing step
-        # (yaw-invariant; the arena yaws the duck ~59 deg). Threshold 0.2 m/s
-        # sits in a measured clear gap: flapping <=0.02, clean gaits >=0.4,
-        # leader 2.2. The flapping regime gets ~0 payoff, the real gait keeps
-        # its full 5.0 x tanh(reach/target) - amplitude is only rewarded in
-        # service of motion.
+        # Body-frame forward velocity at the landing step (yaw-invariant; the
+        # arena yaws the duck ~59 deg). Two regimes measured: flapping
+        # v_steady ~0.00-0.02 m/s, our natural gait ~0.4, leader 2.2.
+        # WALK17: the walk15b BINARY gate (vx > 0.2) is replaced by a SMOOTH
+        # RAMP tanh(vx/0.25). 0.2 sat above the policy's ~0.4 cruise, so the
+        # clean gait earned zero stride and the landscape re-attracted the
+        # posture; the ramp gives the 0.3-0.4 gait partial credit (~0.62-0.80)
+        # while flapping (vx~0) still earns ~0 - no cliff, so PPO can climb
+        # through intermediate speeds instead of binary on/off.
         vx_fwd = self._asset.data.root_link_lin_vel_b[:, 0]
-        moving = (vx_fwd > 0.2).float()
-        env.extras["log"]["Metrics/stride_vx_fwd"] = vx_fwd[moving.bool()].mean() \
-            if torch.any(moving.bool()) else torch.zeros((), device=vx_fwd.device)
+        moving = torch.tanh(vx_fwd / 0.25).clamp(min=0.0)
+        env.extras["log"]["Metrics/stride_vx_fwd"] = vx_fwd.clamp(min=0.0).mean()
+        # WALK17: the target is now COMMAND-SCALED. walk16 proved the gate is
+        # not the bottleneck: the duck holds a steady 0.41 m/s gait
+        # (stride_vx_fwd flat, fell_over 0.5 = flapping legs) that the whole
+        # ~12/step landscape (upright/pose/air_time/lean/head_pose/forward_speed)
+        # subsidises, while track_linear_velocity (2.0) is the only voice for
+        # the 1.2 command. The amp-sweep bistability (locked 0.55 at every
+        # command) means a FIXED target cannot break the 0.4 attractor - at
+        # every command the policy gets the same amplitude hill. So the reach
+        # demand now SCALES WITH THE COMMAND: at 1.2 (arena top) the full 0.15
+        # base reach is demanded; at a 0.4 command only 50% of it. A 0.4 m/s
+        # gait can no longer satisfy a 1.15 command, so the reward at high
+        # command outranks the 0.4-gait subsidisation and PPO must climb
+        # speed. Standing (cmd~0) floors at 50% but the command gate (active)
+        # still zeroes it.
+        cmd_speed = command[:, 0].abs()
+        frac = (cmd_speed / 1.2).clamp(0.5, 1.0)
+        run_target = target * frac
         reward = (
-            torch.tanh(self._peak_fwd / max(target, 1e-6))
+            torch.tanh(self._peak_fwd / torch.maximum(run_target.unsqueeze(1), torch.tensor(1e-6, device=run_target.device)))
             * landing.float()
             * active.unsqueeze(1)
             * moving.unsqueeze(1)
@@ -1652,6 +1665,21 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         # gait basin. Gated on command (active>0.01) so it does NOT re-subsidise
         # the standing basin (walk11/14 fix stays intact); it double-rewards the
         # air_time 3.0 bounding gait, so stride and clearance push together.
+        #
+        # WALK17 (2026-10-17): the __call__ now SCALES the target with the
+        # command (0.5..1.0 x base) and gates the payoff on a SMOOTH
+        # tanh(vx/0.25) motion ramp. walk16 (fixed target 0.15, binary gate)
+        # trained to a steady 0.41 m/s gait - stride_vx_fwd flat, fell_over 0.5
+        # (legs flapping), error_vel_xy 0.8 vs the 1.2 command - and its
+        # checkpoints regime-flip in the arena: 23700/23900 finish the 1.15
+        # course in ~50s at 0.07-0.08 m/s, 23800 finishes 0.8 in 38.7s (leader
+        # es2: 2.213 m/s at 1.15 in 0.90s). The whole high-weight landscape
+        # (upright/pose/air_time/lean/head_pose/forward_speed) subsidises the
+        # 0.4 gait, so a fixed reach target is the same hill at every command
+        # and PPO never climbs speed. Command-scaling makes a 0.4 gait INABLED
+        # to satisfy a 1.15 command (reach 0.028 vs demand 0.144 -> tanh 0.19,
+        # vs tanh 0.37 at the low command), so the stride term's gradient flips
+        # against the slow gait exactly where the arena needs the fast one.
         weight=5.0,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
