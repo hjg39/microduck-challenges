@@ -1679,7 +1679,15 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         # gradient (was 0.79) and the leader's cruise is the landscape argmax.
         # Floor slope 4.7 > the old 4.2, so the walk12 escape-from-standing
         # gradient survives the shape change.
-        weight=8.0,
+        # WALK20 (2026-10-17): 8.0 -> 16.0. The ReLU tail's SLOPE scales linearly
+        # with the weight, so doubling it doubles the 1.2-region's pull over the
+        # 0.45 gait (the landscape argmax gap 0.45->1.2 goes from 1.12 to 2.24
+        # /step). Paired with the tightened velocity_tracking_std (0.6->0.3) this
+        # makes "track the 1.2 command AND run fast" the steepest available slope,
+        # which is the only way to break the 0.45-0.52 balance lock (walk19 held
+        # 0.44 stride_vx_fwd all run -> 3.08-3.2 s, stuck). Cap stays 2.2 so a
+        # runaway gait still hits a flat top.
+        weight=16.0,
         params={
             "kick_ref": 0.25,
             "tail_ref": 2.2,   # walk13: retarget to the leader's cruise (was 1.6, flat above it)
@@ -1857,10 +1865,22 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         func=microduck_mdp.velocity_tracking_std_curriculum,
         params={
             "reward_name": "track_linear_velocity",
+            # WALK20 (2026-10-17, Harry: "still haven't beaten 3s"): the std was
+            # frozen at 0.6 for the WHOLE run (all three stages 0.6) — a ceiling.
+            # 0.6 is loose enough that a 0.45 m/s gait under the 1.2 command
+            # scores ~0.99/step (exp(-0.81/0.36)), so the duck settles at 0.45 and
+            # the Gaussian barely notices; the ReLU forward_speed tail is capped at
+            # 2.2 and the balance terms subsidise 0.45, so the landscape is flat.
+            # Tightening to 0.3 makes 0.45 cost ~0.87 (exp(-0.81/0.09)) and the
+            # 1.2 command a real gradient: the duck must TRACK the command, which
+            # is the only way to force the gait past its 0.45-0.52 balance lock.
+            # (0.3 still loose enough not to destabilise the walk19 basin; 0.3 was
+            # the original pre-walk12 value that caused the standing death-spiral,
+            # but that was before the ReLU forward_speed + 1.2 command bootstrap.)
             "std_stages": [
-                {"step": 0, "std": 0.6},
-                {"step": 1000 * NUM_STEPS_PER_ENV, "std": 0.6},
-                {"step": 2000 * NUM_STEPS_PER_ENV, "std": 0.6},
+                {"step": 0, "std": 0.3},
+                {"step": 1000 * NUM_STEPS_PER_ENV, "std": 0.3},
+                {"step": 2000 * NUM_STEPS_PER_ENV, "std": 0.3},
             ],
         },
     )
