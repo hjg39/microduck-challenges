@@ -79,8 +79,9 @@ def pitch_of(v):
 
 n = trace.shape[0]
 start = min(args.skip, max(0, n - 5))
-trunk_pitch, head_gaze, fwd_speed, x_progress = [], [], [], []
+trunk_pitch, head_gaze, fwd_speed, x_progress, y_progress = [], [], [], [], []
 x0 = trace[start, 0]
+y0 = trace[start, 1]
 for t in range(start, n):
     fr = trace[t]
     mj_data.qpos[:3] = fr[0:3]
@@ -95,13 +96,15 @@ for t in range(start, n):
     head_gaze.append(pitch_of(v_head) - pitch_of(v_trunk))
     fwd_speed.append(float(fr[0]))
     x_progress.append(fr[0] - x0)
+    y_progress.append(fr[1] - y0)
 
 trunk_pitch = np.array(trunk_pitch)
 head_gaze = np.array(head_gaze)
 fwd_speed = np.array(fwd_speed)
+y_progress = np.array(y_progress)
 x_progress = np.array(x_progress)
 
-print(f"frames used: {start}..{n}  (dx={x_progress[-1]:.2f} m over {len(x_progress)} frames)")
+print(f"frames used: {start}..{n}  (dx={x_progress[-1]:.2f} m dy={y_progress[-1]:.2f} m over {len(x_progress)} frames, max_lat={np.abs(y_progress).max():.2f})")
 print(f"trunk pitch (world, deg, + = nose DOWN): mean={trunk_pitch.mean():+.2f}  "
       f"p10={np.percentile(trunk_pitch, 10):+.2f}  p50={np.percentile(trunk_pitch, 50):+.2f}  "
       f"p90={np.percentile(trunk_pitch, 90):+.2f}")

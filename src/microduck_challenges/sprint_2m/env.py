@@ -214,13 +214,22 @@ def straight_line_reward(env: ManagerBasedRlEnv, length_m: float = 2.0) -> torch
     if prev is None:
         env._finish_dist_prev = dist
         return torch.zeros(env.num_envs, device=env.device)
-    reward = (prev - dist) * 2.0  # closer -> positive, farther -> negative
+    # WALK19 (2026-10-17, Harry: "running into the wall a lot - restore the
+    # previous straight-line approach"): the ReLU forward_speed (walk18, w8)
+    # pays 3.23/step at the 0.4 gait and rewards body-local +x velocity
+    # regardless of heading, so a duck drifting ACROSS the 0.8 m arena lane
+    # still earns full forward reward — nothing prices the sideways component.
+    # At gain 2.0 (weight 1.0) this term paid ~0.008/step, a rounding error
+    # next to forward_speed. Gain 6.0 triples it: a 0.4 m/s forward sprint
+    # earns ~0.024/step, and lateral motion at the same speed subtracts —
+    # the direction-specific gradient the ReLU gradient is blind to.
+    reward = (prev - dist) * 6.0  # closer -> positive, farther -> negative
     env._finish_dist_prev = dist
     return reward
 
 
 def lateral_drift_penalty(env: ManagerBasedRlEnv, length_m: float = 2.0,
-                          strip_width: float = 0.155) -> torch.Tensor:
+                          strip_width: float = 0.10) -> torch.Tensor:
     """Penalise sideways drift beyond a *wide* strip centred on the lane.
 
     Complements ``straight_line_reward``: that term rewards *net* progress
@@ -255,17 +264,28 @@ def lateral_drift_penalty(env: ManagerBasedRlEnv, length_m: float = 2.0,
     along = (vec * axis).sum(dim=-1, keepdim=True)
     lateral = vec - along * axis                # perpendicular part = the offset
     lat_offset = torch.linalg.vector_norm(lateral, dim=-1)
-    # Free inside the strip (0.155 m = 2.5x body width): zero cost, the duck
-    # weaves/self-corrects for free. Beyond the edge: a SMOOTHSTEP ramp to a
-    # full unit penalty at 2.5x the edge (0.39 m off-centre — well inside the
-    # 0.8 m arena lane). Smoothstep is used rather than a linear ramp because a
-    # linear/clamped penalty left a dead-zone with NO gradient in the 15-39 cm
+    # Free inside the strip: zero cost, the duck weaves/self-corrects for
+    # free. Beyond the edge: a SMOOTHSTEP ramp to a full unit penalty at 2.5x
+    # the edge, then FLAT. Smoothstep is used rather than a linear ramp because
+    # a linear/clamped penalty left a dead-zone with NO gradient in the 15-39 cm
     # band, so the duck wandered there and fell at speed (walk8: lateral_drift
     # pinned at -0.33, high-speed arena runs falling). The smoothstep gives a
     # gentle, always-present pull back to the centreline (its derivative is 0
-    # at the strip edge and 0 again at full strength — no boundary-sitting),
-    # restoring the steady centring discipline the earlier *velocity* penalty
-    # provided, while keeping the strip itself free.
+    # at the strip edge and 0 again at full strength — no boundary-sitting).
+    #
+    # WALK19 (2026-10-17, Harry: "running into the wall a lot"): the arena lane
+    # is only 0.8 m wide (walls at ±0.40 m). At strip_width 0.155 m (the 2026-
+    # 10-16 2.5x-body value, set for a wide *sandbox* lane, not the 0.8 m
+    # arena lane) the smoothstep hits its FLAT full-penalty top at 1.55x the
+    # edge = 0.39 m — PAST the wall at 0.40 m, so across the 0.155-0.40 m band
+    # the duck felt a constant pull that ran out of slope exactly at the wall
+    # (walk18 lateral_drift pinned at -0.86/step = the duck sat ~0.3 m off-
+    # centre all episode, outside the 0.31 m strip, with no gradient to get
+    # back). Tighten strip_width 0.155 -> 0.10 m (1.25x body -> 1.0x): free
+    # strip 0.20 m (still weaves self-correcting), flat top at 0.25 m — the
+    # whole 0.10-0.25 m band now sits INSIDE the lane with live pull, and the
+    # wall at 0.40 m is beyond the flat top where the pull is at maximum.
+    # Weight -1.5 -> -3.0: double the centring force.
     norm = (lat_offset - strip_width) / strip_width
     s = torch.clamp(norm * 0.4, min=0.0, max=1.0)   # 0 at edge -> 1 at 2.5x edge
     return s * s * (3.0 - 2.0 * s)                    # smoothstep
@@ -1717,37 +1737,41 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         },
     )
 
-    # --- Straight-line-toward-finish reward (2026-10-13) ---
+    # --- Straight-line-toward-finish reward (2026-10-13, WALK19 gain x3) ---
     # The 2026-10-13 run's policy wandered off a straight line to the finish.
-    # forward_speed rewards speed regardless of direction; this term rewards
-    # *progress toward the finish* (potential-based: change in distance-to-
-    # finish, anchored to the spawn pose). Positive when the duck closes the
-    # gap, negative when it drifts or backtracks. Gain 2.0 → a 0.5 m/s forward
-    # sprint earns ~0.008/step: modest, so it refines direction without
-    # outvoting the forward/standing terms.
+    # forward_speed rewards speed regardless of direction (body-local +x); this
+    # term rewards *progress toward the finish* (potential-based: change in
+    # distance-to-finish, anchored to the spawn pose) so the DIRECTION of motion
+    # is priced — a sideways drift subtracts even at full forward speed.
+    # WALK19 (2026-10-17): gain 2.0 -> 6.0 (see straight_line_reward). Weight
+    # stays 1.0; the gain carries the re-weight so a 0.4 m/s run earns
+    # ~0.024/step and any cross-lane motion costs, against the walk18 ReLU
+    # forward_speed paying 3.23/step.
     cfg.rewards["straight_line"] = RewardTermCfg(
         func=straight_line_reward,
         weight=1.0,
         params={"length_m": 2.0},
     )
 
-    # --- Lateral-drift / lane-strip penalty (2026-10-13, reworked 2026-10-16) ---
+    # --- Lateral-drift / lane-strip penalty (2026-10-13, reworked 2026-10-16,
+    #     strip tightened 2026-10-17 WALK19) ---
     # 2026-10-16 (Harry: "moving in a perfect straight line should be much more
     # lenient — stay within a wide strip of about 2.5x the duck's width"): this
-    # is now a *position* penalty with a wide free strip, not a velocity cost.
-    # Zero cost while the duck's lateral offset from the lane centreline is
-    # within strip_width (0.155 m = 1.25x the 0.124 m trunk width -> 0.31 m
-    # strip, ~2.5x the body); a smoothstep ramp to a unit penalty at 2.5x the
-    # edge. Inside the strip the duck can weave and self-correct for free.
-    # Weight -1.5: a constant moderate pull back to the centreline. The earlier
-    # -0.5 with the velocity penalty was the duck's steady-state ~20-100cm-off
-    # balance (walk8: lateral_drift pinned at -0.33, high-speed arena runs
-    # falling). -1.5 makes the far-off state costly enough to correct, while
-    # the smoothstep keeps it gentle close to the line.
+    # is a *position* penalty with a free strip, not a velocity cost. Zero cost
+    # while the duck's lateral offset from the lane centreline is inside
+    # strip_width; a smoothstep ramp to a full unit penalty at 2.5x the edge,
+    # then flat.
+    # WALK19 (2026-10-17, Harry: "running into the wall a lot"): the arena lane
+    # is 0.8 m wide (walls ±0.40 m) and the 2026-10-16 strip (0.31 m) + weight
+    # -1.5 left the duck ~0.3 m off-centre with the penalty already at its flat
+    # top (0.39 m) — no gradient to get back, so it sat there and hit the wall.
+    # strip_width 0.155 -> 0.10 m (flat top 0.25 m, inside the lane) and weight
+    # -1.5 -> -3.0, so the 0.10-0.25 m band has a live, doubled pull to
+    # centre and the wall at 0.40 m sits at maximum pull.
     cfg.rewards["lateral_drift"] = RewardTermCfg(
         func=lateral_drift_penalty,
-        weight=-1.5,
-        params={"length_m": 2.0, "strip_width": 0.155},
+        weight=-3.0,
+        params={"length_m": 2.0, "strip_width": 0.10},
     )
 
     # --- Head-acceleration penalty (2026-10-13) ---
