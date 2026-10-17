@@ -712,10 +712,27 @@ class StrideLength:
         active = (
             torch.linalg.vector_norm(command[:, :2], dim=-1) > command_threshold
         ).float()
+        # walk15b motion gate: big reach only pays if it PRODUCES motion.
+        # walk15 (5x ungated) was beaten by an amplitude-hack attractor within
+        # 100 iters: the 5-seed arena probe on 23700 showed the policy flapping
+        # its feet in place (trunk +/-160 deg, v_steady ~0.00-0.02 m/s, 0/5
+        # finishes at 0.8/1.15; the 22900 baseline was 9/10 at 0.8) - it pays
+        # the stride reward for a large peak_fwd reach WITHOUT net displacement.
+        # Gate the payoff on the body-frame forward velocity at the landing step
+        # (yaw-invariant; the arena yaws the duck ~59 deg). Threshold 0.2 m/s
+        # sits in a measured clear gap: flapping <=0.02, clean gaits >=0.4,
+        # leader 2.2. The flapping regime gets ~0 payoff, the real gait keeps
+        # its full 5.0 x tanh(reach/target) - amplitude is only rewarded in
+        # service of motion.
+        vx_fwd = self._asset.data.root_link_lin_vel_b[:, 0]
+        moving = (vx_fwd > 0.2).float()
+        env.extras["log"]["Metrics/stride_vx_fwd"] = vx_fwd[moving.bool()].mean() \
+            if torch.any(moving.bool()) else torch.zeros((), device=vx_fwd.device)
         reward = (
             torch.tanh(self._peak_fwd / max(target, 1e-6))
             * landing.float()
             * active.unsqueeze(1)
+            * moving.unsqueeze(1)
         )
 
         n_land = torch.clamp(torch.sum(landing.float()), min=1.0)
