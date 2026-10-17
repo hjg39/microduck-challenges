@@ -865,7 +865,24 @@ def _make_base_env_cfg(
     #     nose-down past ~19°, where the trunk would actually flip.
     # The pose/foot/stride/forward_speed terms below carry the speed push;
     # this block only shapes the POSTURE to match the leader.
-    cfg.rewards["upright"].weight = 0.0
+    # 2026-10-17 walk14: bring the symmetric upright (roll+pitch tilt) cost
+    # BACK — it was 0.0 from walk10 onward. Measured the hole (arena traces,
+    # measure_arena_pose world-y "trunk pitch"): at high arena command
+    # (0.8/1.15) the walk12/walk13 policies TIP ONTO THEIR SIDE — a *lateral*
+    # roll of ~45-52 deg — then lie or flap there. That lateral tilt is priced
+    # by NO forward-axis term (forward_lean_* only see the pitch), and with
+    # upright at 0.0 the only continuous balance cost, a 45-52 deg roll sits
+    # BELOW the 70 deg fell_over gate and the 3 cm head gate, i.e. cost-FREE:
+    # PPO has no gradient to un-tip, and the forward_speed/tracking speed
+    # gradient can't engage because the duck isn't upright to walk. The leader
+    # (es2) was trained WITH upright at the base 2.0 and sprints upright
+    # (world-y trunk +0.4 deg), so a real gait is compatible with the cost —
+    # ours simply lost it. Weight 1.0 (half the base 2.0): a moderate balance
+    # gradient hard enough to un-tip, while forward_lean_reward (2.0, to the
+    # speed-scaled setpoint) still NET-rewards the forward lean, so we keep the
+    # leader's forward-lean sprint. (walk10 zeroed upright to protect the lean;
+    # that over-reached and left the *lateral* tip unpriced.)
+    cfg.rewards["upright"].weight = 1.0
     cfg.rewards["upright"].params["std"] = math.sqrt(0.08)
     cfg.rewards["forward_lean_reward"] = RewardTermCfg(
         func=forward_lean_reward,
