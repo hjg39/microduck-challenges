@@ -457,7 +457,7 @@ def _forward_velocity(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torc
 def forward_speed_reward(
     env: ManagerBasedRlEnv,
     kick_ref: float = 0.25,
-    tail_ref: float = 1.6,
+    tail_ref: float = 2.2,
     command_name: str = "twist",
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
@@ -468,31 +468,26 @@ def forward_speed_reward(
         0.5 * tanh(clamp(vx, 0) / kick_ref)  +  0.5 * tanh(clamp(vx, 0) / tail_ref)
 
     where ``vx`` is the robot's ACTUAL forward speed (``_forward_velocity``).
-    The outer weight is 3.0. Two components, one direction — a reward that
-    INCREASES monotonically with real forward speed:
+    The outer weight is 4.0 (walk12). Two components, one direction — a reward
+    that INCREASES monotonically with real forward speed:
 
       * KICK (0.5, ref 0.25) — a steep gradient for the first 0.25 m/s of
         motion. This is the term that pulls the policy OFF the standing basin:
         a robot at vx≈0.03 earns ~0.06/step, one moving at 0.3 earns ~0.6.
-      * TAIL (0.5, ref 1.6) — a long gradient that keeps rising toward the
-        leader's ~2 m/s sprint and saturates just past it. The arena leader
-        finishes 2 m in 0.9 s (avg ~2.2 m/s); the reference walker peaked at
-        0.4. This tail is the only term with a live gradient all the way to
-        the leader gait.
+      * TAIL (0.5, ref 2.2) — a long gradient that stays LIVE across the whole
+        arena sweep (0.2–1.2) and through the leader's ~2.2–2.5 m/s sprint.
 
-    WALK11 BUG (measured 2026-10-16): the walk11 form was
-    ``0.75*tanh(deficit/0.4) + 0.25*tanh(vx/0.8)`` with
-    ``deficit = clamp(vx_cmd - vx, 0)``. The deficit SATURATES at a 0.4 m/s
-    gap, so a robot STANDING under a 1.2 m/s command (deficit 1.2) earned
-    0.75*0.995+0.25*0 ≈ 0.75 unit → 2.25/step, while a robot WALKING AT the
-    command (deficit 0) earned only 0.25*0.87 ≈ 0.22 unit → 0.66/step.
-    Standing was rewarded 3.3× more than walking — the "push out of
-    standing" became the standing subsidy, and 100 PPO iters of it dragged a
-    healthy walker (re-seeded model_21400) into the standing basin. The fix
-    is to reward actual speed monotonically: standing pays ~0.06 (weight 3.0:
-    ~0.19/step), walking at 1.2 pays ~2.4/step, and the gradient is live up
-    to the leader gait. Command-relative terms are kept for the lean pair
-    only (where the gate is on ACTUAL velocity, so standing collects nothing).
+    WALK13 (2026-17): the walk12 tail (ref 1.6) was ~96% saturated at 1.6 m/s
+    and 99% at 2.2 — the leader's cruise — so above the policy's 0.4 m/s
+    plateau the term was a FLAT plateau with no gradient, and 20k more iters
+    consolidated the plateau instead of climbing it (arena measurement:
+    walk12-21900 finishes 2 m at 0.65 cmd in 3.7 s but decays to a stop at
+    0.8/1.15, ~0.2–0.3 m/s, trunk upright; the leader at 1.15 hits 2.5 m/s,
+    0.90 s, +3° lean). Retargeting the tail to the leader's cruise (2.2) makes
+    tanh(vx/2.2) live up to the top of the arena sweep: at 1.2 the tail is
+    0.51 (was 0.89) and the unit reward at 1.2 is 0.94 (was 1.05 at 2.5), so
+    "keep getting faster" is the steepest available gradient again, while the
+    kick still dominates at the floor. Standing is unchanged (tanh(0) = 0).
     """
     vx = _forward_velocity(env, asset_cfg)
     command = env.command_manager.get_command(command_name)
@@ -1594,7 +1589,7 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         weight=4.0,
         params={
             "kick_ref": 0.25,
-            "tail_ref": 1.6,
+            "tail_ref": 2.2,   # walk13: retarget to the leader's cruise (was 1.6, flat above it)
             "command_name": "twist",
             "asset_cfg": SceneEntityCfg("robot"),
         },
@@ -1614,7 +1609,7 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         params={
             "asset_cfg": SceneEntityCfg("robot"),
             "height_sensor_name": "foot_height_scan",
-            "target": 0.25,
+            "target": 0.35,
             "lift_threshold": 0.005,
             "command_name": "twist",
             "command_threshold": 0.01,
@@ -1724,18 +1719,23 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # 2026-10-13 re-balance: the old ramp tightened 0.5 -> 0.3 by iter 1000, but
     # the duck was still standing (error ~1.3 m/s) — at std 0.3 the Gaussian is
     # exp(-1.3^2/0.09) ~ 0, i.e. DEAD, so the forward tracking reward collapsed
-    # 1.26 -> 0.56 over the run and standing won. Hold std at 0.5 (a live
-    # gradient at error 1.3: exp(-1.3^2/0.25) ~ 0.27) until a gait actually
-    # exists, then tighten gently. forward_speed (above) carries the bootstrap;
-    # this term only refines once the duck is moving.
+    # 1.26 -> 0.56 over the run and standing won.
+    # WALK13 (2026-17): walk12 RESUMES from this checkpoint, so the curriculum
+    # counter is already past the final stage and the std is FROZEN at 0.3 for
+    # the whole walk12/walk13 run. At the 0.4 m/s cruise under a 1.2 command
+    # (error 0.8) exp(-0.8^2/0.09) ~ 0.003 — DEAD again: the tracking reward
+    # carried no "go faster" gradient at the plateau. Hold it at 0.6 (a live
+    # gradient at error 0.8: exp(-0.8^2/0.36) ~ 0.16) all run; the forward_speed
+    # tail (retargeted to 2.2, above) carries the bootstrap, this term refines
+    # the command-tracking once the duck moves.
     cfg.curriculum["velocity_tracking_std"] = CurriculumTermCfg(
         func=microduck_mdp.velocity_tracking_std_curriculum,
         params={
             "reward_name": "track_linear_velocity",
             "std_stages": [
-                {"step": 0, "std": 0.5},
-                {"step": 1000 * NUM_STEPS_PER_ENV, "std": 0.4},
-                {"step": 2000 * NUM_STEPS_PER_ENV, "std": 0.3},
+                {"step": 0, "std": 0.6},
+                {"step": 1000 * NUM_STEPS_PER_ENV, "std": 0.6},
+                {"step": 2000 * NUM_STEPS_PER_ENV, "std": 0.6},
             ],
         },
     )
