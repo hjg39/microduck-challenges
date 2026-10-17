@@ -488,12 +488,33 @@ def forward_speed_reward(
     0.51 (was 0.89) and the unit reward at 1.2 is 0.94 (was 1.05 at 2.5), so
     "keep getting faster" is the steepest available gradient again, while the
     kick still dominates at the floor. Standing is unchanged (tanh(0) = 0).
+
+    WALK18 (2026-10-17): the tanh tail is STILL the plateau. At weight 4.0 it
+    pays 2.20/step at the 0.4 m/s gait (55% of its max) and only 0.79/step
+    more for climbing 0.4->1.2 — the balance landscape (upright/pose/air_time/
+    lean/head_pose) outvoted the climb, so every reseed since walk11 has
+    re-locked the same 0.4-0.55 gait at every command (walk17 24200: 0.45 m/s
+    at 1.15, clean trunk, leader is 2.213). Replace the tail with a CAPPED
+    ReLU, min(vx, tail_ref)/tail_ref: 0.0->0, 0.4->0.18, 1.2->0.55, 2.2->1.0,
+    flat above. Unit payoff at the walk18 weight 8.0 (shares 0.3/0.7):
+      0.0 -> 0.00/step   slope at floor = 8.0*(0.3/0.25 + 0.7/2.2) = 4.7,
+              steeper than the old tanh's 4.2 (0.5/0.25 + 0.5/2.2 at w4), so
+              the walk12 escape-from-standing gradient is INTACT.
+      0.4 -> 3.23/step (was 2.20 at w4 — the 0.4 gait is still well paid,
+              it is no longer the argmax)
+      1.2 -> 5.45/step (the 0.4->1.2 climb now pays 2.22/step of LIVE
+              gradient, vs 0.79 before — 2.8x the climb incentive)
+      2.2 -> 8.00/step = the landscape ARGMAX (was 3.52), flat above (cap)
+    The cap preserves the tanh's saturation safety (a runaway gait >2.2 earns
+    no more). Standing unchanged (0 at vx=0).
     """
     vx = _forward_velocity(env, asset_cfg)
     command = env.command_manager.get_command(command_name)
     assert command is not None
     speed = torch.clamp(vx, min=0.0)
-    return 0.5 * torch.tanh(speed / kick_ref) + 0.5 * torch.tanh(speed / tail_ref)
+    kick = torch.tanh(speed / kick_ref)
+    tail = torch.clamp(speed, max=tail_ref) / tail_ref
+    return 0.3 * kick + 0.7 * tail
 
 
 def forward_lean_penalty(
@@ -1633,7 +1654,12 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # subsidise it.
     cfg.rewards["forward_speed"] = RewardTermCfg(
         func=forward_speed_reward,
-        weight=4.0,
+        # WALK18: 4.0 -> 8.0. The ReLU tail (0.7 share) is linear to 2.2 m/s,
+        # so at the new weight the 0.4->1.2 climb pays 1.12/step of LIVE
+        # gradient (was 0.79) and the leader's cruise is the landscape argmax.
+        # Floor slope 4.7 > the old 4.2, so the walk12 escape-from-standing
+        # gradient survives the shape change.
+        weight=8.0,
         params={
             "kick_ref": 0.25,
             "tail_ref": 2.2,   # walk13: retarget to the leader's cruise (was 1.6, flat above it)
