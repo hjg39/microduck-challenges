@@ -1738,7 +1738,15 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         params={
             "asset_cfg": SceneEntityCfg("robot"),
             "height_sensor_name": "foot_height_scan",
-            "target": 0.15,
+            # WALK21 (2026-10-18): re-target at the leader's MEASURED bound foot
+            # swing. The stride probe (metal/measure_arena_stride.py, DT=0.02,
+            # trunk-frame) measured the leader es2's per-step forward reach at
+            # 0.165 m vs our 0.101 m. walk15 set this to 0.15 (the leader's
+            # arena-reach at the time); the stride probe's cleaner measurement is
+            # 0.165. Paired with the command-range extension (0..1.5, below) this
+            # makes the bound's long stride the explicit target at the high
+            # commands where the bound gait now forms.
+            "target": 0.165,
             "lift_threshold": 0.005,
             "command_name": "twist",
             "command_threshold": 0.01,
@@ -1877,10 +1885,26 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             # (0.3 still loose enough not to destabilise the walk19 basin; 0.3 was
             # the original pre-walk12 value that caused the standing death-spiral,
             # but that was before the ReLU forward_speed + 1.2 command bootstrap.)
+            #
+            # WALK21 (2026-10-18): re-WIDEN to 1.0. The reward-economics probe
+            # (running the leader in our training env) showed the leader reverts
+            # to the walk (mean 0.55-0.64) even with this term zeroed — the bound
+            # is suppressed by the training landscape, and the specific
+            # bound-killer is this SYMMETRIC gaussian: a bound that overshoots a
+            # <=1.2 command (running 1.5-2.2) has a 0.3-1.0 m/s tracking error,
+            # which at std 0.3 scores exp(-0.09..-1.0/0.09) ~= 0, so the bound
+            # earns ~0 tracking while the walk (tracking its low command) earns
+            # the full 2.0/step. The arena has NO tracking term, so the bound is
+            # free there — that's why the leader bounds in the arena but walks in
+            # our env. Widening to 1.0 makes a 0.7-1.2 m/s overshoot score
+            # exp(-0.49..-1.44) = 0.44-0.62, so the bound can EXCEED the command
+            # without being punished, and (at the extended 1.5 command) it now
+            # tracks BETTER than the walk. This is the direct anti-suppressor that
+            # lets the bound attractor form in training.
             "std_stages": [
                 {"step": 0, "std": 0.3},
-                {"step": 1000 * NUM_STEPS_PER_ENV, "std": 0.3},
-                {"step": 2000 * NUM_STEPS_PER_ENV, "std": 0.3},
+                {"step": 1000 * NUM_STEPS_PER_ENV, "std": 0.6},
+                {"step": 2000 * NUM_STEPS_PER_ENV, "std": 1.0},
             ],
         },
     )
@@ -1897,7 +1921,20 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                 {"step": 0, "lin_vel_range": 0.1, "ang_vel_range": 0.0},
                 {"step": 500 * NUM_STEPS_PER_ENV, "lin_vel_range": 0.4, "ang_vel_range": 0.0},
                 {"step": 1000 * NUM_STEPS_PER_ENV, "lin_vel_range": 0.8, "ang_vel_range": 0.0},
-                {"step": 1500 * NUM_STEPS_PER_ENV, "lin_vel_range": 1.2, "ang_vel_range": 0.0},
+                # WALK21 (2026-10-18): the arena sweeps 0.2-1.2 m/s, but the
+                # LEADER's bound gait runs at ~2.2-2.4 m/s — it BOUNDS PAST its
+                # command. The reward-economics probe (running the leader in our
+                # training env with the arena-absent track_linear_velocity term
+                # zeroed) shows the leader is BIMODAL: p50 0.62 (walk) / p90 1.34
+                # / p99 1.71 — it has a bound attractor our unimodal 0.63 walk
+                # lacks. But that bound is SUPPRESSED in our current env: our
+                # command range caps at 1.2, so the symmetric track_linear_velocity
+                # (std 0.3) penalises any bound that overshoots 1.2, and the bound
+                # reverts to a walk. Extending the final stage to 1.5 (the bound's
+                # home; forward_speed's cap is 2.2) makes the arena-matching
+                # forward_speed term REWARD the bound in training, where it is
+                # currently punished. This is the lever to form the bound attractor.
+                {"step": 1500 * NUM_STEPS_PER_ENV, "lin_vel_range": 1.5, "ang_vel_range": 0.0},
             ],
             "update_lin_vel_y": False,
             "update_ang_vel_z": False,
