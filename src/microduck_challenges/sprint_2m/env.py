@@ -1049,7 +1049,16 @@ def _make_base_env_cfg(
     # matching gradient to null the bias. (track_linear_velocity is untouched: it
     # tracks only the linear command, so the new angular command cannot fight the
     # walk/bound speed lock.)
-    cfg.rewards["track_angular_velocity"].params["std"] = 0.35
+    # WALK23 (2026-10-19, post-walk22-collapse): std 0.35 -> 0.5. walk22's 0.35
+    # over-priced the gait's NATURAL step-frequency yaw oscillation (+/-0.3
+    # rad/s every stride): the gaussian prices INSTANTANEOUS motion, not net
+    # drift, so a healthy walk's own stride was 3-4x more expensive than at
+    # 0.707. The gait's rational answer was to move less (forward_speed 1.0 ->
+    # 0.25, falls 8 -> 15, arena 5/5 -> 0/5, trunk nose-down -174 deg). 0.5
+    # keeps a ~2x veer-price over the 0.707 that let the veer through, without
+    # suffocating the stride. (The LEADER's bound averages 0.07-0.4 rad/s yaw,
+    # so 0.35 would have priced the bound too -- a further reason to relax.)
+    cfg.rewards["track_angular_velocity"].params["std"] = 0.5
 
     # Walk straight. The Arena commands yaw 0 and never tells the policy its
     # heading, and nothing above prices a slow drift: at this std a 0.07 rad/s
@@ -1821,10 +1830,23 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # Pair with the ang_vel_range lever below (the arena
     # commands yaw 0, so the drift strip is the arena-transferable steering
     # price).
+    # WALK23 (2026-10-19, post-walk22-collapse): weight -6.0 -> -4.0, strip
+    # 0.08 -> 0.10. walk22's -6/0.08 made the veer the DOMINANT cost (the
+    # healthy 29600 paid -5/step to it, 30 weighted -- the biggest negative in
+    # the landscape) and the 0.08 strip sat the live-slope right at the edge of
+    # the gait's own 0.06 m oscillation, so a centred gait was *never* free.
+    # The rational gait response was to slow down (less speed -> less veer ->
+    # less -5/step) rather than steer back, so forward_speed decayed 1.0 ->
+    # 0.25 and the gait fell to a nose-down shuffle. -4/0.10 keeps the veer
+    # ~33% more priced than walk20's -3 (which let the 0.12 m veer through) but
+    # restores a *real* free-band (0.10 m > the 0.06 m oscillation, so a
+    # centred gait pays 0) and roughly halves the constant live-slope cost, so
+    # the gait keeps running and the drift price motivates steering back instead
+    # of slowing down.
     cfg.rewards["lateral_drift"] = RewardTermCfg(
         func=lateral_drift_penalty,
-        weight=-6.0,
-        params={"length_m": 2.0, "strip_width": 0.08},
+        weight=-4.0,
+        params={"length_m": 2.0, "strip_width": 0.10},
     )
 
     # --- Head-acceleration penalty (2026-10-13) ---
