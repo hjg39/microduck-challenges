@@ -1036,7 +1036,20 @@ def _make_base_env_cfg(
     cfg.rewards["track_linear_velocity"].weight = knobs["forward_reward"]
     cfg.rewards["track_linear_velocity"].params["std"] = math.sqrt(0.1)
     cfg.rewards["track_angular_velocity"].weight = 2.0
-    cfg.rewards["track_angular_velocity"].params["std"] = math.sqrt(0.5)
+    # WALK22 (2026-10-19): the veer fix. std 0.707 -> 0.35 rad/s. The veer is a
+    # SIGNED gait yaw-rate bias (the arena commands yaw exactly 0 — sprint-2m.toml
+    # [command] vel=[vx, 0.0, 0.0], lateral AND yaw pinned, only the vx index
+    # moves on the sweep — so a yaw rate is the ONE thing the arena both commands
+    # and never rewards). track_angular's reward is exp(-(err/std)^2) on the
+    # yaw rate, and at std 0.707 (std^2=0.5) it is nearly flat below ~0.2 rad/s:
+    # a 0.1 rad/s (5.7 deg/s) veer costs only 1-exp(-0.01/0.5)=0.02, a 0.3
+    # rad/s (17 deg/s) veer 0.17. At std 0.35 (std^2=0.1225) the same veers cost
+    # 0.08 and 0.52 — a ~3-4x pricier per degree of turn, and the command's exact
+    # 0 (plus the new +/-0.6 range, below) gives a live, symmetric, arena-
+    # matching gradient to null the bias. (track_linear_velocity is untouched: it
+    # tracks only the linear command, so the new angular command cannot fight the
+    # walk/bound speed lock.)
+    cfg.rewards["track_angular_velocity"].params["std"] = 0.35
 
     # Walk straight. The Arena commands yaw 0 and never tells the policy its
     # heading, and nothing above prices a slow drift: at this std a 0.07 rad/s
@@ -1376,6 +1389,12 @@ def _make_base_env_cfg(
     # reference walker then peaked at exactly 0.40 m/s — the top of that range.
     command.ranges.lin_vel_x = (0.20, 1.20)
     command.ranges.lin_vel_y = (0.0, 0.0)
+    # WALK22 (2026-10-19): base stays yaw-0 (arena-matching); the final-stage
+    # angular command below opens ±0.6 via the curriculum. A ±0.6 rad/s yaw
+    # command means "steer to cancel the veer" — at 0.6 rad/s the trunk turns
+    # 34 deg/s, enough to hold a 2 m lane. Early stages keep 0.0 (the walk
+    # lock at low speed needs no steering) so the curriculum reaches ±0.6
+    # together with the 1.5 command where the veer actually shows up.
     command.ranges.ang_vel_z = (0.0, 0.0)
     command.viz.z_offset = 0.5
     cfg.commands["twist"] = microduck_mdp.VelocityCommandCommandOnlyCfg(**vars(command))
@@ -1784,10 +1803,28 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # strip_width 0.155 -> 0.10 m (flat top 0.25 m, inside the lane) and weight
     # -1.5 -> -3.0, so the 0.10-0.25 m band has a live, doubled pull to
     # centre and the wall at 0.40 m sits at maximum pull.
+    # WALK22 (2026-10-19, Harry: "one thing it does a lot is veer to the
+    # left"): the veer was PRE-EXISTING (walk20 28599 ran the same -1.5..-1.8
+    # /step) but walk21's harder gait + 1.5 command makes it the dominant cost
+    # in the run (-1.6..-1.9, >10% of reward) and arena-visible (drifts to
+    # the 0.2-0.48 m band, repeatedly at the high commands; the sign flips run
+    # to run = a slow random walk, not a fixed yaw bias). weight -3.0 -> -6.0:
+    # at -3 the 0.10-0.25 m band still netted the policy a reason to sit there
+    # (the flat top -3/step < the forward-speed slope), so it did; at -6 the
+    # band costs 6/step at its top, which nothing else pays back, so the live
+    # smoothstep slope is the only way to stop losing points — the duck must
+    # hold the centreline. Also tighten strip_width 0.10 -> 0.08 m (free strip
+    # 0.16 m = 1.29x the 0.124 m trunk: the arena lane is 0.8 m wide and the
+    # duck's own walk oscillates ~0.06 m, so 0.08 still leaves a real free
+    # band, but the live-slope band starts at 0.08 m instead of 0.10 m, i.e.
+    # 2 cm earlier — the drift is corrected before it becomes a wall problem).
+    # Pair with the ang_vel_range lever below (the arena
+    # commands yaw 0, so the drift strip is the arena-transferable steering
+    # price).
     cfg.rewards["lateral_drift"] = RewardTermCfg(
         func=lateral_drift_penalty,
-        weight=-3.0,
-        params={"length_m": 2.0, "strip_width": 0.10},
+        weight=-6.0,
+        params={"length_m": 2.0, "strip_width": 0.08},
     )
 
     # --- Head-acceleration penalty (2026-10-13) ---
@@ -1934,10 +1971,22 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                 # home; forward_speed's cap is 2.2) makes the arena-matching
                 # forward_speed term REWARD the bound in training, where it is
                 # currently punished. This is the lever to form the bound attractor.
-                {"step": 1500 * NUM_STEPS_PER_ENV, "lin_vel_range": 1.5, "ang_vel_range": 0.0},
+                # WALK22 (2026-10-19, Harry: "one thing it does a lot is veer to
+                # the left"): the final stage ALSO opens the angular command to
+                # ±0.6 rad/s (was 0.0 — the arena-matching pin from 2026-10-13).
+                # The base config pins yaw 0 from the start, so a resumed run
+                # would otherwise keep the veer unpriceable: track_angular
+                # (the only term that reads the command's yaw) is gaussian around
+                # 0 and flat below 0.16 rad/s, so a slow veer costs ~nothing.
+                # With ±0.6 the command manager can ask for a CORRECTION turn as
+                # well, and track_angular's tighter std 0.35 makes holding the
+                # heading a real cost — the gait must learn to steer itself.
+                # update_ang_vel_z flips on only for the final stage, so the
+                # early walk-lock is untouched.
+                {"step": 1500 * NUM_STEPS_PER_ENV, "lin_vel_range": 1.5, "ang_vel_range": 0.6},
             ],
             "update_lin_vel_y": False,
-            "update_ang_vel_z": False,
+            "update_ang_vel_z": True,
             "forward_only": True,
         },
     )
