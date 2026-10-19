@@ -1994,21 +1994,28 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                 # forward_speed term REWARD the bound in training, where it is
                 # currently punished. This is the lever to form the bound attractor.
                 # WALK22 (2026-10-19, Harry: "one thing it does a lot is veer to
-                # the left"): the final stage ALSO opens the angular command to
+                # the left"): the final stage ALSO opened the angular command to
                 # ±0.6 rad/s (was 0.0 — the arena-matching pin from 2026-10-13).
-                # The base config pins yaw 0 from the start, so a resumed run
-                # would otherwise keep the veer unpriceable: track_angular
-                # (the only term that reads the command's yaw) is gaussian around
-                # 0 and flat below 0.16 rad/s, so a slow veer costs ~nothing.
-                # With ±0.6 the command manager can ask for a CORRECTION turn as
-                # well, and track_angular's tighter std 0.35 makes holding the
-                # heading a real cost — the gait must learn to steer itself.
-                # update_ang_vel_z flips on only for the final stage, so the
-                # early walk-lock is untouched.
-                {"step": 1500 * NUM_STEPS_PER_ENV, "lin_vel_range": 1.5, "ang_vel_range": 0.6},
+                # WALK24 (2026-10-19): REVERTED to 0.0. The ±0.6 was a poison
+                # pill: the command manager samples a random yaw TARGET on every
+                # reset, so the PPO optimum became a gait with weak angular gain
+                # (lean into the commanded turn). Matching a 0.5 rad/s command
+                # costs up to -4/step in lateral_drift, so the gait partially
+                # responds: the lateral bias grows (29800: +0.19 m right, the
+                # "drifting right" Harry saw), then FLIPS sign (30000: -0.14,
+                # 30100: -0.34) as the gait slowly rotates (vx->0, yaw -1.6/s),
+                # and forward_speed decays 0.8 -> 0.2. Both walk22 and walk23
+                # decayed at the SAME pace; the only binary diff between the
+                # STABLE walk21 (ang cmd 0) and both decays is this command,
+                # while the reward weights varied between the two decays without
+                # changing them. The arena commands yaw EXACTLY 0 and never
+                # rewards it, so the turn-response habit is pure training cost.
+                # With the command back at 0, track_angular (std 0.5) becomes a
+                # pure "hold rotation at 0" de-biaser — the arena's own command.
+                {"step": 1500 * NUM_STEPS_PER_ENV, "lin_vel_range": 1.5, "ang_vel_range": 0.0},
             ],
             "update_lin_vel_y": False,
-            "update_ang_vel_z": True,
+            "update_ang_vel_z": False,
             "forward_only": True,
         },
     )
