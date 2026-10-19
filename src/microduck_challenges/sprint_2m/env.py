@@ -47,6 +47,10 @@ ENABLE_VELOCITY_PUSHES = True  # Velocity-based pushes for robustness training
 ENABLE_IMU_ORIENTATION_RANDOMIZATION = True  # Simulates mounting errors
 ENABLE_ENCODER_BIAS = True  # Per-env joint encoder calibration offset (actor obs sees joint_pos + bias)
 ENABLE_BASE_ORIENTATION_RANDOMIZATION = False  # Randomize initial tilt to force reactive behavior
+# walk25/26 arena-match gate (default ON; WALK25_ARENA_MATCH=0 reverts to the
+# full training env). Module-level so BOTH the event block in
+# _make_base_env_cfg and the algorithm block in make_env_cfg can read it.
+WALK25_ARENA_MATCH = os.environ.get("WALK25_ARENA_MATCH", "1") != "0"
 
 # Head/body pose command tracking (replaces the old neck-offset disturbance scheme).
 # Head pose: 4D deltas-from-HOME on neck/head joints; vel env tracks these as a
@@ -1156,8 +1160,7 @@ def _make_base_env_cfg(
     # 0.12-0.13 + the per-episode DR ranges — stays: the arena also spawns with a
     # small joint/yaw perturbation, so that is arena-faithful robustness, not a
     # bound-killer.)
-    arena_match = os.environ.get("WALK25_ARENA_MATCH", "1") != "0"
-    if ENABLE_VELOCITY_PUSHES and not arena_match:
+    if ENABLE_VELOCITY_PUSHES and not WALK25_ARENA_MATCH:
         # In play mode, use shorter interval for better visibility
         interval = (0.5, 1.0) if play else VELOCITY_PUSH_INTERVAL_S
 
@@ -2107,10 +2110,17 @@ RL_CFG = RslRlOnPolicyRunnerCfg(
         # entropy floor keeps it exploring early. (An entropy-coef *curriculum*
         # can't reach the PPO algorithm from an env curriculum — the runner owns
         # the algorithm — so this is a static bump instead.)
-        entropy_coef=0.03,
+        # walk26: under the arena-match (WALK25_ARENA_MATCH=1) the policy is the
+        # GRAFTED LEADER, not a from-scratch one — the standing-escape bump is
+        # wrong there. With the actor normalizer frozen, every weight step moves
+        # the output directly, and 0.03 entropy at lr 1e-3 ballooned the dist
+        # std 0.48-1.01 -> 0.70-1.31 in 100 iters (7-15% weight drift), shredding
+        # the bound (12 s fwd p90 0.72 -> 0.07, 45 falls). Grafted runs need
+        # gentle, reward-guided movement instead: lr 1e-4, entropy 0.005.
+        entropy_coef=0.005 if WALK25_ARENA_MATCH else 0.03,
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=1.0e-3,
+        learning_rate=1.0e-4 if WALK25_ARENA_MATCH else 1.0e-3,
         schedule="adaptive",
         gamma=0.99,
         lam=0.95,
