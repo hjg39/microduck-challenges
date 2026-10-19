@@ -26,6 +26,7 @@ gait/feet terms, curriculum-ramped action-rate smoothing), with:
 """
 
 import math
+import os
 from copy import deepcopy
 
 NUM_STEPS_PER_ENV = 24
@@ -1033,7 +1034,18 @@ def _make_base_env_cfg(
     cfg.rewards["angular_momentum"].weight = -0.02
 
     # Velocity tracking rewards
-    cfg.rewards["track_linear_velocity"].weight = knobs["forward_reward"]
+    # WALK25 (2026-10-19, the graft + arena-match): the ARENA has no
+    # velocity-tracking term, so this is the single biggest bound-suppressor
+    # removed. The frozen-leader probes (v1-v4) showed the leader reverts to a
+    # walk in the full training env (push + TLV + resamples) but its bound is
+    # fastest over the arena's ~1.15 s sprint. track_linear_velocity is a
+    # SYMMETRIC gaussian on (vx - cmd): a bound that overshoots its 1.15
+    # command (running 1.5-2.2, the leader's bound) earns ~0 from it while the
+    # walk earns the full weight -> the bound is outvoted. Zeroing the weight
+    # (arena-exact) keeps the standard/curriculum inert (weight 0 -> reward 0
+    # at every error) and lets forward_speed (16.0, the landscape argmax at the
+    # leader's 2.2 m/s cruise) be the only forward-velocity voice.
+    cfg.rewards["track_linear_velocity"].weight = 0.0
     cfg.rewards["track_linear_velocity"].params["std"] = math.sqrt(0.1)
     cfg.rewards["track_angular_velocity"].weight = 2.0
     # WALK22 (2026-10-19): the veer fix. std 0.707 -> 0.35 rad/s. The veer is a
@@ -1136,8 +1148,16 @@ def _make_base_env_cfg(
 
     cfg.events["reset_base"].params["pose_range"]["z"] = (0.12, 0.13)
 
-    # Velocity-based pushes for robustness training
-    if ENABLE_VELOCITY_PUSHES:
+    # Velocity-based pushes for robustness training.
+    # WALK25 (2026-10-19, arena-match): the ARENA has no velocity pushes, so
+    # they are REMOVED by default (the bound-suppressor: a ±0.3 m/s shove every
+    # 3-6 s interrupts a developing stride). Set WALK25_ARENA_MATCH=0 to restore
+    # them for an A/B. (The arena's initial reset perturbation — base pose z
+    # 0.12-0.13 + the per-episode DR ranges — stays: the arena also spawns with a
+    # small joint/yaw perturbation, so that is arena-faithful robustness, not a
+    # bound-killer.)
+    arena_match = os.environ.get("WALK25_ARENA_MATCH", "1") != "0"
+    if ENABLE_VELOCITY_PUSHES and not arena_match:
         # In play mode, use shorter interval for better visibility
         interval = (0.5, 1.0) if play else VELOCITY_PUSH_INTERVAL_S
 
@@ -1153,6 +1173,13 @@ def _make_base_env_cfg(
                 "asset_cfg": SceneEntityCfg("robot"),
             },
         )
+    else:
+        # WALK25 arena-match: the inherited (upstream) push_robot must be
+        # REMOVED, not just not-re-added — the base cfg template already
+        # carries it, and the ARENA has no velocity pushes (the bound-
+        # suppressor). Pop it so the event manager doesn't apply ±0.3 m/s
+        # shoves every 3-6 s.
+        cfg.events.pop("push_robot", None)
 
     # Domain randomization — re-sampled per episode at reset. In mjlab 1.3.0 the
     # stock dr.* ops with operation="add"/"scale" read from the compile-time
@@ -1977,9 +2004,16 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         params={
             "command_name": "twist",
             "velocity_stages": [
-                {"step": 0, "lin_vel_range": 0.1, "ang_vel_range": 0.0},
-                {"step": 500 * NUM_STEPS_PER_ENV, "lin_vel_range": 0.4, "ang_vel_range": 0.0},
-                {"step": 1000 * NUM_STEPS_PER_ENV, "lin_vel_range": 0.8, "ang_vel_range": 0.0},
+                # WALK25 (2026-10-19, arena-match): FLAT 1.15 from step 0 (was
+                # 0.1 -> 0.4 -> 0.8 -> 1.5). The frozen normalizer is in-
+                # distribution on the arena's command distribution (vx ~ [0,
+                # 1.335]); the early ramp's low commands (0.1-0.8) sit far from
+                # its mean 0.668 and would feed the bound weights out-of-
+                # distribution obs every iter. 1.15 is in-range (|1.15-0.668|/
+                # 0.316 ~ 1.5 std) and is the top of the arena sweep, so the
+                # bound trains at the arena's command from iter 0 — matching the
+                # v3/v4 probes that held the leader at a flat 1.15.
+                {"step": 0, "lin_vel_range": 1.15, "ang_vel_range": 0.0},
                 # WALK21 (2026-10-18): the arena sweeps 0.2-1.2 m/s, but the
                 # LEADER's bound gait runs at ~2.2-2.4 m/s — it BOUNDS PAST its
                 # command. The reward-economics probe (running the leader in our
@@ -2012,7 +2046,15 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                 # rewards it, so the turn-response habit is pure training cost.
                 # With the command back at 0, track_angular (std 0.5) becomes a
                 # pure "hold rotation at 0" de-biaser — the arena's own command.
-                {"step": 1500 * NUM_STEPS_PER_ENV, "lin_vel_range": 1.5, "ang_vel_range": 0.0},
+                # WALK25 (2026-10-19, arena-match): 1.5 -> 1.15. The frozen
+                # normalizer's home range is the ARENA's command distribution
+                # (vx uniform [0, 1.335] -> mean 0.668 / std 0.316); the frozen
+                # leader weights expect THAT input scale. 1.5 (walk21-24) was
+                # outside the arena sweep (0.20-1.20) and the normalizer's range,
+                # pushing the command obs out of the bound's in-distribution box.
+                # 1.15 is the top of the arena sweep AND inside the normalizer's
+                # range, so the bound trains at the arena's command.
+                {"step": 1500 * NUM_STEPS_PER_ENV, "lin_vel_range": 1.15, "ang_vel_range": 0.0},
             ],
             "update_lin_vel_y": False,
             "update_ang_vel_z": False,

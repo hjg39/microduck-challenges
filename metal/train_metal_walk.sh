@@ -41,7 +41,12 @@ LOG="logs/${RUN_NAME}.metal.log"
 # to only its first element and break the Python syntax). The python side
 # builds the resume flags from it. tyro runs with FlagConversionOff, so the
 # boolean needs an explicit value (--agent.resume true), not a bare flag.
-MICRODUCK_RESUME_RUN="$RESUME_RUN" MICRODUCK_LOAD_CHECKPOINT="$LOAD_CHECKPOINT" .venv-metal/bin/python -c "
+# ACTOR_NORM_FREEZE: freeze the actor observation normalizer at its
+# loaded (grafted) stats. Needed for the walk25 GRAFT (the leader's bound
+# weights expect the arena's normalizer; PPO must not re-estimate it). Default
+# 0 = normal learning behaviour for any non-graft run; pass ACTOR_NORM_FREEZE=1
+# to enable (walk25). The bridge applies it (until=0 at actor construction).
+MICRODUCK_RESUME_RUN="$RESUME_RUN" MICRODUCK_LOAD_CHECKPOINT="$LOAD_CHECKPOINT" ACTOR_NORM_FREEZE="${ACTOR_NORM_FREEZE:-0}" .venv-metal/bin/python -c "
 import metal.bridge
 from mjlab_microduck.train_cli import main
 import os, sys
