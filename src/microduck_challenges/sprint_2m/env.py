@@ -2117,11 +2117,19 @@ RL_CFG = RslRlOnPolicyRunnerCfg(
         # std 0.48-1.01 -> 0.70-1.31 in 100 iters (7-15% weight drift), shredding
         # the bound (12 s fwd p90 0.72 -> 0.07, 45 falls). Grafted runs need
         # gentle, reward-guided movement instead: lr 1e-4, entropy 0.005.
+        # walk27: walk26's model_100 still lost the bound (1.15 s p90 0.172,
+        # fell 25) — because rsl-rl's schedule="adaptive" (ppo.py:269) multiplies
+        # the lr x1.5 every step where KL < desired/2, and a grafted policy's KL
+        # is low, so it self-ramps 1e-5 -> 2.56e-4 and drifts hidden weights
+        # 15-21% in 100 iters: a quench that scrambles the bound's fine timing.
+        # walk25's std-ballooning AND walk26's weight-drift both trace to this
+        # schedule. Fixed schedule + lr 1e-5 = slow reward-guided anneal;
+        # entropy stays 0.005 (the std-lock that worked in walk26).
         entropy_coef=0.005 if WALK25_ARENA_MATCH else 0.03,
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=1.0e-4 if WALK25_ARENA_MATCH else 1.0e-3,
-        schedule="adaptive",
+        learning_rate=1.0e-5 if WALK25_ARENA_MATCH else 1.0e-3,
+        schedule="fixed" if WALK25_ARENA_MATCH else "adaptive",
         gamma=0.99,
         lam=0.95,
         desired_kl=0.01,
